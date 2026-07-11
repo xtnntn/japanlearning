@@ -3,7 +3,7 @@ use reqwest::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, path::PathBuf, process::Command, sync::Mutex};
+use std::{collections::HashSet, fs, path::PathBuf, process::Command, sync::Mutex, time::Duration};
 use tauri::{Manager, State};
 use tauri_plugin_notification::NotificationExt;
 use thiserror::Error;
@@ -113,6 +113,7 @@ struct AiStatus {
   configured: bool,
   model: String,
   base_url: String,
+  protocol: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,8 +370,23 @@ fn model_entry() -> Result<keyring::Entry, AppError> {
     .map_err(|error| AppError::Message(format!("无法访问 macOS Keychain：{error}")))
 }
 
+fn protocol_entry() -> Result<keyring::Entry, AppError> {
+  keyring::Entry::new("com.xtnntn.nihongo-daily-reader", "openai-compatible-protocol")
+    .map_err(|error| AppError::Message(format!("无法访问 macOS Keychain：{error}")))
+}
+
+fn keychain_fallback_password(account: &str) -> Option<String> {
+  let output = Command::new("/usr/bin/security")
+    .args(["find-generic-password", "-s", "com.xtnntn.nihongo-daily-reader", "-a", account, "-w"])
+    .output()
+    .ok()?;
+  if !output.status.success() { return None; }
+  String::from_utf8(output.stdout).ok().map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
+}
+
 fn get_api_key() -> Option<String> {
-  api_key_entry().ok()?.get_password().ok().filter(|key| !key.trim().is_empty())
+  api_key_entry().ok().and_then(|entry| entry.get_password().ok()).filter(|key| !key.trim().is_empty())
+    .or_else(|| keychain_fallback_password("openai-api-key"))
 }
 
 fn get_base_url() -> String {
@@ -378,6 +394,7 @@ fn get_base_url() -> String {
     .ok()
     .and_then(|entry| entry.get_password().ok())
     .filter(|url| !url.trim().is_empty())
+    .or_else(|| keychain_fallback_password("openai-compatible-base-url"))
     .unwrap_or_else(|| "https://api.openai.com/v1".into())
 }
 
@@ -386,7 +403,15 @@ fn get_model() -> String {
     .ok()
     .and_then(|entry| entry.get_password().ok())
     .filter(|model| !model.trim().is_empty())
+    .or_else(|| keychain_fallback_password("openai-compatible-model"))
     .unwrap_or_else(|| "gpt-5.6-luna".into())
+}
+
+fn get_protocol() -> String {
+  protocol_entry().ok().and_then(|entry| entry.get_password().ok())
+    .or_else(|| keychain_fallback_password("openai-compatible-protocol"))
+    .filter(|protocol| matches!(protocol.as_str(), "responses" | "chat_completions"))
+    .unwrap_or_else(|| "responses".into())
 }
 
 fn responses_url(base_url: &str) -> Result<String, AppError> {
@@ -402,6 +427,15 @@ fn responses_url(base_url: &str) -> Result<String, AppError> {
   Ok(base)
 }
 
+fn chat_completions_url(base_url: &str) -> Result<String, AppError> {
+  let mut base = base_url.trim().trim_end_matches('/').to_string();
+  let parsed = url::Url::parse(&base)
+    .map_err(|_| AppError::Message("Base URL 必须是完整的 http:// 或 https:// 地址".into()))?;
+  if !matches!(parsed.scheme(), "http" | "https") { return Err(AppError::Message("Base URL 仅支持 http:// 或 https://".into())); }
+  if !base.ends_with("/chat/completions") { base.push_str("/chat/completions"); }
+  Ok(base)
+}
+
 fn models_url(base_url: &str) -> Result<String, AppError> {
   let responses_endpoint = responses_url(base_url)?;
   Ok(responses_endpoint.trim_end_matches("/responses").to_string() + "/models")
@@ -414,8 +448,48 @@ async fn generate_structured<T: for<'de> Deserialize<'de>>(
   schema_name: &str,
   schema: serde_json::Value,
 ) -> Result<T, AppError> {
-  let endpoint = responses_url(&get_base_url())?;
-  let payload = serde_json::json!({
+  let client = Client::builder().timeout(Duration::from_secs(45)).build()?;
+  let protocol = get_protocol();
+  let output = if protocol == "chat_completions" {
+    let endpoint = chat_completions_url(&get_base_url())?;
+    let chat_system = format!("{system}\n\n必须只返回一个符合要求的 JSON 对象，不要 Markdown 或额外说明。");
+    let mut payload = serde_json::json!({
+      "model": get_model(),
+      "messages": [
+        { "role": "system", "content": chat_system },
+        { "role": "user", "content": user }
+      ],
+      "response_format": {
+        "type": "json_schema",
+        "json_schema": {
+          "name": schema_name,
+          "strict": true,
+          "schema": schema.clone()
+        }
+      }
+    });
+    let mut response = client.post(&endpoint).bearer_auth(api_key).json(&payload).send().await?;
+    if !response.status().is_success() && matches!(response.status().as_u16(), 400 | 422) {
+      payload["response_format"] = serde_json::json!({ "type": "json_object" });
+      response = client.post(&endpoint).bearer_auth(api_key).json(&payload).send().await?;
+    }
+    if !response.status().is_success() && matches!(response.status().as_u16(), 400 | 422) {
+      payload.as_object_mut().map(|object| object.remove("response_format"));
+      response = client.post(&endpoint).bearer_auth(api_key).json(&payload).send().await?;
+    }
+    if !response.status().is_success() {
+      let status = response.status();
+      let detail = response.text().await.unwrap_or_default();
+      return Err(AppError::Message(format!("Chat Completions 请求失败：{status} {}", detail.chars().take(280).collect::<String>())));
+    }
+    let body: serde_json::Value = response.json().await?;
+    body.get("choices").and_then(|choices| choices.as_array()).and_then(|choices| choices.first())
+      .and_then(|choice| choice.get("message")).and_then(|message| message.get("content"))
+      .and_then(|content| content.as_str()).map(str::to_owned)
+      .ok_or_else(|| AppError::Message("Chat Completions 未返回 choices[0].message.content".into()))?
+  } else {
+    let endpoint = responses_url(&get_base_url())?;
+    let payload = serde_json::json!({
     "model": get_model(),
     "reasoning": { "effort": "low" },
     "input": [
@@ -430,22 +504,27 @@ async fn generate_structured<T: for<'de> Deserialize<'de>>(
         "schema": schema
       }
     }
-  });
-  let response = Client::new()
+    });
+    let response = client
     .post(endpoint)
     .bearer_auth(api_key)
     .json(&payload)
     .send()
     .await?;
-  if !response.status().is_success() {
-    return Err(AppError::Message(format!("OpenAI 请求失败：{}", response.status())));
-  }
-  let body: serde_json::Value = response.json().await?;
-  let output = body
+    if !response.status().is_success() {
+      let status = response.status();
+      let detail = response.text().await.unwrap_or_default();
+      return Err(AppError::Message(format!("Responses 请求失败：{status} {}", detail.chars().take(280).collect::<String>())));
+    }
+    let body: serde_json::Value = response.json().await?;
+    body
     .get("output_text")
     .and_then(|value| value.as_str())
-    .ok_or_else(|| AppError::Message("OpenAI 未返回结构化文本".into()))?;
-  serde_json::from_str(output).map_err(|error| AppError::Message(format!("AI 返回格式无效：{error}")))
+    .map(str::to_owned)
+    .ok_or_else(|| AppError::Message("Responses 未返回 output_text".into()))?
+  };
+  let output = output.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+  serde_json::from_str(output).map_err(|error| AppError::Message(format!("AI 返回 JSON 无效：{error}")))
 }
 
 fn explanation_schema() -> serde_json::Value {
@@ -956,6 +1035,7 @@ fn get_ai_status() -> AiStatus {
     configured: get_api_key().is_some(),
     model: get_model(),
     base_url: get_base_url(),
+    protocol: get_protocol(),
   }
 }
 
@@ -996,7 +1076,7 @@ async fn discover_models(base_url: String, api_key: String) -> Result<Vec<String
 }
 
 #[tauri::command]
-fn save_openai_api_key(api_key: String, base_url: String, model: String) -> Result<(), AppError> {
+fn save_openai_api_key(api_key: String, base_url: String, model: String, protocol: String) -> Result<(), AppError> {
   let cleaned = api_key.trim();
   if cleaned.is_empty() && get_api_key().is_none() {
     return Err(AppError::Message("请先填写 API Key".into()));
@@ -1007,6 +1087,8 @@ fn save_openai_api_key(api_key: String, base_url: String, model: String) -> Resu
   let normalized_base_url = base_url.trim().trim_end_matches('/');
   responses_url(normalized_base_url)?;
   let normalized_model = model.trim();
+  let normalized_protocol = protocol.trim();
+  if !matches!(normalized_protocol, "responses" | "chat_completions") { return Err(AppError::Message("协议必须是 Responses 或 Chat Completions".into())); }
   if normalized_model.is_empty() || normalized_model.len() > 120 || normalized_model.chars().any(char::is_whitespace) {
     return Err(AppError::Message("模型名称不能为空，且不能包含空格".into()));
   }
@@ -1020,6 +1102,9 @@ fn save_openai_api_key(api_key: String, base_url: String, model: String) -> Resu
     .map_err(|error| AppError::Message(format!("无法保存到 macOS Keychain：{error}")))?;
   model_entry()?
     .set_password(normalized_model)
+    .map_err(|error| AppError::Message(format!("无法保存到 macOS Keychain：{error}")))?;
+  protocol_entry()?
+    .set_password(normalized_protocol)
     .map_err(|error| AppError::Message(format!("无法保存到 macOS Keychain：{error}")))
 }
 

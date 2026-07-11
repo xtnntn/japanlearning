@@ -40,6 +40,7 @@ export default function App() {
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
   const [model, setModel] = useState("gpt-5.6-luna");
+  const [protocol, setProtocol] = useState<"responses" | "chat_completions">("responses");
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [detectingModels, setDetectingModels] = useState(false);
   const [keyMessage, setKeyMessage] = useState<string>();
@@ -74,6 +75,7 @@ export default function App() {
         setAiStatus(status);
         setBaseUrl(status.baseUrl);
         setModel(status.model);
+        setProtocol(status.protocol);
         setAvailableModels([status.model]);
         setReminder(reminderStatus);
         setReminderTime(`${String(reminderStatus.hour).padStart(2, "0")}:${String(reminderStatus.minute).padStart(2, "0")}`);
@@ -106,19 +108,17 @@ export default function App() {
     setDeepExplanation(undefined);
     setDeepError(undefined);
     setShowChinese(false);
-    void api.explainSelection(article.id, text, context).then((result) => {
-      setExplanation(result);
-      void api.getProgress().then(setProgress);
-    });
+    void api.explainSelection(article.id, text, context)
+      .then((result) => { setExplanation(result); void api.getProgress().then(setProgress); })
+      .catch((reason) => setDeepError(String(reason)));
   };
 
   const revealChinese = () => {
     if (!article || !selection) return;
     setShowChinese(true);
-    void api.explainSelection(article.id, selection.text, selection.context, true).then((result) => {
-      setExplanation(result);
-      void api.getProgress().then(setProgress);
-    });
+    void api.explainSelection(article.id, selection.text, selection.context, true)
+      .then((result) => { setExplanation(result); void api.getProgress().then(setProgress); })
+      .catch((reason) => setDeepError(String(reason)));
   };
 
   const loadDeepExplanation = async () => {
@@ -178,13 +178,14 @@ export default function App() {
 
   const saveKey = async () => {
     try {
-      await api.saveOpenAiApiKey(apiKey, baseUrl, model);
+      await api.saveOpenAiApiKey(apiKey, baseUrl, model, protocol);
       const status = await api.getAiStatus();
       setAiStatus(status);
       setApiKey("");
       setBaseUrl(status.baseUrl);
       setModel(status.model);
-      setKeyMessage("Base URL、模型和 Key 已保存到 macOS Keychain。下次划词会使用所选模型。");
+      setProtocol(status.protocol);
+      setKeyMessage("Base URL、协议、模型和 Key 已保存到 macOS Keychain。下次划词会使用所选配置。");
     } catch (reason) {
       setKeyMessage(String(reason));
     }
@@ -319,6 +320,7 @@ export default function App() {
         <button className="settings-button" onClick={() => {
           setBaseUrl(aiStatus?.baseUrl ?? "https://api.openai.com/v1");
           setModel(aiStatus?.model ?? "gpt-5.6-luna");
+          setProtocol(aiStatus?.protocol ?? "responses");
           setShowSettings(true);
         }}>AI 设置</button>
         <button className="settings-button" onClick={() => void openWeeklyAssessment()}>本周独立评估</button>
@@ -373,27 +375,25 @@ export default function App() {
               <p className="chinese">{deepExplanation.chineseDetails}</p>
             </div>}
             {deepError && <small className="inline-error">深入解释失败：{deepError}</small>}
-          </> : <p className="thinking">正在生成受控难度的日语提示…</p>}
+          </> : deepError ? <p className="inline-error">生成失败：{deepError}<br />请关闭后重新划选一次。</p> : <p className="thinking">正在生成受控难度的日语提示…</p>}
         </section>
       )}
 
       {showSettings && <section className="settings-modal">
-        <div className="settings-card">
+        <div className="settings-card ai-settings-card">
           <button className="close" onClick={() => setShowSettings(false)} aria-label="关闭">×</button>
-          <p className="eyebrow">OpenAI 兼容 Responses API</p>
+          <p className="eyebrow">OpenAI 兼容 API</p>
           <h3>AI 解释设置</h3>
-          <p>当前状态：{aiStatus?.configured ? `已配置（${aiStatus.model}）` : "未配置，本地降级解释中"}</p>
-          <label className="field-label" htmlFor="base-url">Base URL</label>
-          <input id="base-url" type="url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setAvailableModels([]); }} placeholder="https://api.openai.com/v1" autoComplete="url" />
-          <label className="field-label" htmlFor="api-key">API Key</label>
-          <input id="api-key" type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setAvailableModels([]); }} placeholder={aiStatus?.configured ? "已安全保存；仅在替换 Key 时输入" : "粘贴 API Key"} autoComplete="off" />
+          <p>当前状态：{aiStatus?.configured ? `已配置（${aiStatus.model} · ${aiStatus.protocol === "chat_completions" ? "Chat Completions" : "Responses"}）` : "未配置，本地降级解释中"}</p>
+          <div className="ai-config-grid">
+            <div className="wide-field"><label className="field-label" htmlFor="base-url">Base URL</label><input id="base-url" type="url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setAvailableModels([]); }} placeholder="https://api.openai.com/v1" autoComplete="url" /></div>
+            <div><label className="field-label" htmlFor="protocol">调用协议</label><select id="protocol" value={protocol} onChange={(event) => setProtocol(event.target.value as "responses" | "chat_completions")}><option value="responses">Responses</option><option value="chat_completions">Chat Completions</option></select></div>
+            <div><label className="field-label" htmlFor="model">模型</label><select id="model" value={model} onChange={(event) => setModel(event.target.value)} disabled={availableModels.length === 0}>{availableModels.length === 0 ? <option>请先检测可用模型</option> : availableModels.map((name) => <option key={name} value={name}>{name}</option>)}</select></div>
+            <div className="wide-field"><label className="field-label" htmlFor="api-key">API Key</label><input id="api-key" type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setAvailableModels([]); }} placeholder={aiStatus?.configured ? "已安全保存；仅在替换 Key 时输入" : "粘贴 API Key"} autoComplete="off" /></div>
+          </div>
           <button className="detect-models" onClick={() => void detectModels()} disabled={!baseUrl.trim() || (!apiKey.trim() && !aiStatus?.configured) || detectingModels}>{detectingModels ? "正在检测模型…" : "检测可用模型"}</button>
-          <label className="field-label" htmlFor="model">模型</label>
-          <select id="model" value={model} onChange={(event) => setModel(event.target.value)} disabled={availableModels.length === 0}>
-            {availableModels.length === 0 ? <option>请先检测可用模型</option> : availableModels.map((name) => <option key={name} value={name}>{name}</option>)}
-          </select>
           <button className="save-key" onClick={() => void saveKey()} disabled={!baseUrl.trim() || availableModels.length === 0 || (!apiKey.trim() && !aiStatus?.configured)}>保存设置到 macOS Keychain</button>
-          <small>已保存过 Key 时，留空即可复用 Keychain 中的密钥；只在替换密钥时重新输入。检测会请求 <code>Base URL/models</code>，程序随后调用同一服务的 <code>/responses</code>。</small>
+          <small>已保存过 Key 时，留空即可复用 Keychain 中的密钥。Responses 调用 <code>/responses</code>；Chat Completions 调用 <code>/chat/completions</code>。你的 tokendance 网关应选择后者。</small>
           {keyMessage && <p className="key-message">{keyMessage}</p>}
           <div className="settings-divider" />
           <p className="eyebrow">每日阅读提醒</p>

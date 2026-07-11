@@ -54,7 +54,7 @@ export type AssessmentQuestion = { id: string; prompt: string; choices: string[]
 export type AssessmentResult = { score: number; total: number; levelHint: string };
 export type WeeklyAssessment = { id: string; week: string; article: Article; questions: Question[]; completed: boolean; result?: AssessmentResult };
 
-export type AiStatus = { configured: boolean; model: string; baseUrl: string };
+export type AiStatus = { configured: boolean; model: string; baseUrl: string; protocol: "responses" | "chat_completions" };
 
 export const api = {
   getTodayArticle: () => invoke<Article>("get_today_article"),
@@ -70,7 +70,7 @@ export const api = {
   getProgress: () => invoke<Progress>("get_progress"),
   getAiStatus: () => invoke<AiStatus>("get_ai_status"),
   discoverModels: (baseUrl: string, apiKey: string) => invoke<string[]>("discover_models", { baseUrl, apiKey }),
-  saveOpenAiApiKey: (apiKey: string, baseUrl: string, model: string) => invoke<void>("save_openai_api_key", { apiKey, baseUrl, model }),
+  saveOpenAiApiKey: (apiKey: string, baseUrl: string, model: string, protocol: "responses" | "chat_completions") => invoke<void>("save_openai_api_key", { apiKey, baseUrl, model, protocol }),
   getTitleCandidates: () => invoke<TitleCandidate[]>("get_title_candidates"),
   saveTitleVote: (candidate: TitleCandidate, vote: string) => invoke<void>("save_title_vote", { candidate, vote }),
   getInitialAssessment: () => invoke<AssessmentQuestion[]>("get_initial_assessment"),

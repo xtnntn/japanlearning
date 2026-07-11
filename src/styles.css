@@ -61,12 +61,15 @@ blockquote { margin: 10px 0; padding: 10px 13px; border-left: 3px solid #6a917e;
 .feedback-panel { bottom: 40px; right: 470px; width: 340px; }
 .feedback-options { display: grid; gap: 7px; }
 .feedback-confirmed { color: #315e50; font-weight: 700; }
-.settings-modal { position: fixed; z-index: 30; inset: 0; display: grid; place-items: center; background: rgba(25, 31, 25, .22); }
-.settings-card { position: relative; width: 460px; padding: 30px; border: 1px solid #d9d5c8; border-radius: 14px; background: #fffefa; box-shadow: 0 24px 70px rgba(20, 30, 20, .25); }
+.settings-modal { position: fixed; z-index: 30; inset: 0; display: grid; place-items: center; padding: 24px; overflow: auto; overscroll-behavior: contain; background: rgba(25, 31, 25, .22); }
+.settings-card { position: relative; width: 460px; max-height: calc(100vh - 48px); padding: 30px; border: 1px solid #d9d5c8; border-radius: 14px; overflow-y: auto; overscroll-behavior: contain; background: #fffefa; box-shadow: 0 24px 70px rgba(20, 30, 20, .25); }
+.ai-settings-card { width: min(760px, calc(100vw - 70px)); }
 .settings-card h3 { margin: 0 0 8px; font-size: 25px; }
 .settings-card p { color: #5f655c; line-height: 1.6; }
 .field-label { display: block; margin: 15px 0 -3px; color: #5f655c; font-size: 12px; font-weight: 700; letter-spacing: .04em; }
 .settings-card input, .settings-card select { width: 100%; margin: 10px 0; padding: 12px; border: 1px solid #d5d4ca; border-radius: 7px; background: #fff; }
+.ai-config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+.ai-config-grid .wide-field { grid-column: 1 / -1; }
 .settings-card select:disabled { color: #8a8e85; background: #f1f0ea; }
 .detect-models { width: 100%; margin: 2px 0 5px; padding: 10px; border: 1px solid #315e50; border-radius: 7px; color: #315e50; background: #f7fbf5; }
 .detect-models:disabled { opacity: .55; cursor: default; }

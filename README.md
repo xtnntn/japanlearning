@@ -11,7 +11,7 @@
 - 过滤会员提示、用户投稿和过短正文，保留原图及第三方视频/社媒来源；
 - 文章内任意划词：先显示简短日语提示，按需展开中文；
 - 需要时可主动请求深入解释，默认划词请求不会自动变长；
-- OpenAI API Key 未配置时提供可用的本地降级解释；配置后使用 Responses API 生成结构化解释；
+- OpenAI API Key 未配置时提供可用的本地降级解释；配置后可选择 Responses 或 Chat Completions 生成结构化解释；
 - API Key 保存到 macOS Keychain，不写入前端、Git 或 SQLite；
 - 到达文末后自动出现带原文证据的理解题；
 - 首次标题兴趣校准（想看 / 无感 / 不想看）；
@@ -62,7 +62,7 @@ npm run tauri dev
 
 应用右上角点击“AI 设置”，输入兼容服务的 Base URL 和 API Key，检测服务实际提供的模型，选择后保存。
 
-Base URL、模型与 Key 会进入 macOS Keychain，之后由 Rust 后端读取并调用兼容的 Responses API。前端不会回显已保存的 Key；修改 Base URL 或模型时可以留空复用现有 Key。不要将 Key 写入 `.env`、源码、SQLite 或 Git 提交。
+Base URL、调用协议、模型与 Key 会进入 macOS Keychain。选择 `Responses` 时调用 `/responses`；选择 `Chat Completions` 时调用 `/chat/completions`。前端不会回显已保存的 Key；修改 Base URL、协议或模型时可以留空复用现有 Key。不要将 Key 写入 `.env`、源码、SQLite 或 Git 提交。
 
 每日提醒也在“AI 设置”中配置。只有点击“启用提醒”后，应用才会写入用户级 `launchd` 配置；关闭提醒会移除该配置。
 

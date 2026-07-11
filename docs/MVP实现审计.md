@@ -16,7 +16,8 @@
 - 标题投票、题材反馈、利用/探索选文排序；
 - 最近 14 天按文章长度和难度校正的划词趋势；
 - 新语境旧表达与理解题绑定的独立理解率；
-- Base URL、API Key、模型发现和 macOS Keychain 持久化；
+- Base URL、API Key、模型发现、Responses / Chat Completions 协议选择和 macOS Keychain 持久化；
+- AI 设置弹窗使用独立滚动容器，避免滚轮穿透到阅读器；当 Rust keyring 无法读取旧 macOS Keychain 条目时，应用会安全回退到系统 `security` 查询同一条目，不输出或保存密钥明文。
 - 用户主动安装、修改或移除的 `launchd` 每日标题提醒。
 - release `.app` 与 `.dmg` 构建成功；App 完整 ad-hoc 签名通过 `codesign --verify --deep --strict`，DMG 通过 `hdiutil verify`；
 - release App 实际启动后进程路径来自包内可执行文件，`--daily-reminder` 分支可独立运行并正常退出。
@@ -29,7 +30,7 @@
 ## 已实现但仍需真实环境验证
 
 - KAI-YOU 页面结构未来变化时仍需定期运行实时冒烟测试；
-- 不同 OpenAI-compatible 服务对 Responses 结构化输出的兼容性；
+- 第三方 Chat Completions 网关对 JSON Schema 输出的兼容性；App 按 `json_schema`、`json_object`、纯 JSON 提示三层降级。
 - 初始定位实际耗时是否接近 15–20 分钟；
 - 每周评估文章在长期使用中是否始终未读且足够长。
 
