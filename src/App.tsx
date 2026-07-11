@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, type AbilityProfile, type AiStatus, type Article, type AssessmentQuestion, type AssessmentResult, type DeepExplanation, type Explanation, type Progress, type Question, type ReminderStatus, type TitleCandidate, type WeeklyAssessment } from "./api";
+import { api, type AbilityProfile, type AiStatus, type Article, type AssessmentQuestion, type AssessmentResult, type Explanation, type Progress, type Question, type ReminderStatus, type TitleCandidate, type WeeklyAssessment } from "./api";
 
 const feedbackOptions = [
   "想多读这个题材",
@@ -18,10 +18,7 @@ export default function App() {
   const [error, setError] = useState<string>();
   const [selection, setSelection] = useState<SelectionState>();
   const [explanation, setExplanation] = useState<Explanation>();
-  const [deepExplanation, setDeepExplanation] = useState<DeepExplanation>();
-  const [deepLoading, setDeepLoading] = useState(false);
-  const [deepError, setDeepError] = useState<string>();
-  const [showChinese, setShowChinese] = useState(false);
+  const [explanationError, setExplanationError] = useState<string>();
   const [questions, setQuestions] = useState<Question[]>([]);
   const [questionIndex, setQuestionIndex] = useState(0);
   const [answerState, setAnswerState] = useState<{ chosen: number; correct: boolean }>();
@@ -58,6 +55,7 @@ export default function App() {
   const [weeklyAnswers, setWeeklyAnswers] = useState<number[]>([]);
   const [weeklyResult, setWeeklyResult] = useState<AssessmentResult>();
   const readerRef = useRef<HTMLElement>(null);
+  const selectionPopoverRef = useRef<HTMLElement>(null);
   const finishRef = useRef<HTMLDivElement>(null);
   const generatingQuestionsRef = useRef(false);
 
@@ -95,6 +93,18 @@ export default function App() {
       .finally(() => setLoading(false));
   }, []);
 
+  useEffect(() => {
+    if (!selection) return;
+    const closeWhenClickingOutside = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (!selectionPopoverRef.current?.contains(target)) {
+        setSelection(undefined);
+      }
+    };
+    window.addEventListener("pointerdown", closeWhenClickingOutside);
+    return () => window.removeEventListener("pointerdown", closeWhenClickingOutside);
+  }, [selection]);
+
   const handleSelection = () => {
     const nativeSelection = window.getSelection();
     const text = nativeSelection?.toString().trim() ?? "";
@@ -105,28 +115,10 @@ export default function App() {
     const context = range.commonAncestorContainer.parentElement?.closest("p")?.textContent ?? text;
     setSelection({ text, context, x: rect.left + rect.width / 2, y: rect.bottom + 12 });
     setExplanation(undefined);
-    setDeepExplanation(undefined);
-    setDeepError(undefined);
-    setShowChinese(false);
+    setExplanationError(undefined);
     void api.explainSelection(article.id, text, context)
       .then((result) => { setExplanation(result); void api.getProgress().then(setProgress); })
-      .catch((reason) => setDeepError(String(reason)));
-  };
-
-  const revealChinese = () => {
-    if (!article || !selection) return;
-    setShowChinese(true);
-    void api.explainSelection(article.id, selection.text, selection.context, true)
-      .then((result) => { setExplanation(result); void api.getProgress().then(setProgress); })
-      .catch((reason) => setDeepError(String(reason)));
-  };
-
-  const loadDeepExplanation = async () => {
-    if (!selection || deepLoading) return;
-    setDeepLoading(true);
-    try { setDeepExplanation(await api.explainDeeper(selection.text, selection.context)); }
-    catch (reason) { setDeepError(String(reason)); }
-    finally { setDeepLoading(false); }
+      .catch((reason) => setExplanationError(String(reason)));
   };
 
   const finishReading = async () => {
@@ -185,7 +177,7 @@ export default function App() {
       setBaseUrl(status.baseUrl);
       setModel(status.model);
       setProtocol(status.protocol);
-      setKeyMessage("Base URL、协议、模型和 Key 已保存到 macOS Keychain。下次划词会使用所选配置。");
+      setKeyMessage("API Key 已保存到 macOS Keychain；Base URL、协议和模型已保存到本地设置。下次划词会使用所选配置。");
     } catch (reason) {
       setKeyMessage(String(reason));
     }
@@ -360,22 +352,15 @@ export default function App() {
       </section>
 
       {selection && (
-        <section className="selection-popover" style={{ left: selection.x, top: selection.y }}>
-          <button className="close" onClick={() => setSelection(undefined)} aria-label="关闭">×</button>
+        <section ref={selectionPopoverRef} className="selection-popover" style={{ left: selection.x, top: selection.y }}>
           <p className="selected">「{selection.text}」</p>
           {explanation ? <>
-            <p className="jp-hint">{explanation.japaneseHint}</p>
-            <p className="furigana">{explanation.furigana}</p>
-            {showChinese ? <p className="chinese">{explanation.chineseTranslation}</p> : <button className="text-button" onClick={revealChinese}>需要时展开中文翻译</button>}
-            <small>{explanation.note}</small>
-            {!deepExplanation && <button className="deep-button" onClick={() => void loadDeepExplanation()} disabled={deepLoading}>{deepLoading ? "正在深入解释…" : "深入解释"}</button>}
-            {deepExplanation && <div className="deep-explanation">
-              <p>{deepExplanation.japaneseDetails}</p>
-              {deepExplanation.grammarPoints.map((point) => <p key={point}>・{point}</p>)}
-              <p className="chinese">{deepExplanation.chineseDetails}</p>
-            </div>}
-            {deepError && <small className="inline-error">深入解释失败：{deepError}</small>}
-          </> : deepError ? <p className="inline-error">生成失败：{deepError}<br />请关闭后重新划选一次。</p> : <p className="thinking">正在生成受控难度的日语提示…</p>}
+            <p className="reading"><strong>读音</strong> {explanation.reading}</p>
+            <p className="translation"><strong>译文</strong> {explanation.translation}</p>
+            <p><strong>语境</strong> {explanation.contextNote}</p>
+            <div className="example"><strong>例句</strong><p>{explanation.example}</p><p>{explanation.exampleTranslation}</p></div>
+            <p className="grammar"><strong>语法/搭配</strong> {explanation.grammarNote}</p>
+          </> : explanationError ? <p className="inline-error">生成失败：{explanationError}<br />请关闭后重新划选一次。</p> : <p className="thinking">正在结合上下文生成解释…</p>}
         </section>
       )}
 
@@ -392,8 +377,8 @@ export default function App() {
             <div className="wide-field"><label className="field-label" htmlFor="api-key">API Key</label><input id="api-key" type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setAvailableModels([]); }} placeholder={aiStatus?.configured ? "已安全保存；仅在替换 Key 时输入" : "粘贴 API Key"} autoComplete="off" /></div>
           </div>
           <button className="detect-models" onClick={() => void detectModels()} disabled={!baseUrl.trim() || (!apiKey.trim() && !aiStatus?.configured) || detectingModels}>{detectingModels ? "正在检测模型…" : "检测可用模型"}</button>
-          <button className="save-key" onClick={() => void saveKey()} disabled={!baseUrl.trim() || availableModels.length === 0 || (!apiKey.trim() && !aiStatus?.configured)}>保存设置到 macOS Keychain</button>
-          <small>已保存过 Key 时，留空即可复用 Keychain 中的密钥。Responses 调用 <code>/responses</code>；Chat Completions 调用 <code>/chat/completions</code>。你的 tokendance 网关应选择后者。</small>
+          <button className="save-key" onClick={() => void saveKey()} disabled={!baseUrl.trim() || availableModels.length === 0 || (!apiKey.trim() && !aiStatus?.configured)}>保存 AI 设置</button>
+          <small>只有 API Key 会访问 macOS Keychain；Base URL、协议和模型保存在本地应用设置，不会触发钥匙串授权。Responses 调用 <code>/responses</code>；Chat Completions 调用 <code>/chat/completions</code>。你的 tokendance 网关应选择后者。</small>
           {keyMessage && <p className="key-message">{keyMessage}</p>}
           <div className="settings-divider" />
           <p className="eyebrow">每日阅读提醒</p>

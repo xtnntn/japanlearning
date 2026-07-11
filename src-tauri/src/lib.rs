@@ -3,7 +3,7 @@ use reqwest::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, path::PathBuf, process::Command, sync::Mutex, time::Duration};
+use std::{collections::HashSet, fs, path::PathBuf, process::Command, sync::{Mutex, OnceLock}, time::Duration};
 use tauri::{Manager, State};
 use tauri_plugin_notification::NotificationExt;
 use thiserror::Error;
@@ -30,6 +30,16 @@ impl serde::Serialize for AppError {
 
 struct AppState {
   db_path: Mutex<PathBuf>,
+}
+
+static API_KEY_CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static LOCAL_AI_SETTINGS: OnceLock<Mutex<LocalAiSettings>> = OnceLock::new();
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct LocalAiSettings {
+  base_url: Option<String>,
+  model: Option<String>,
+  protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,18 +103,12 @@ struct WeeklyAssessment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Explanation {
-  japanese_hint: String,
-  chinese_translation: String,
-  furigana: String,
-  note: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeepExplanation {
-  japanese_details: String,
-  grammar_points: Vec<String>,
-  chinese_details: String,
+  reading: String,
+  translation: String,
+  context_note: String,
+  example: String,
+  example_translation: String,
+  grammar_note: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -360,19 +364,28 @@ fn api_key_entry() -> Result<keyring::Entry, AppError> {
     .map_err(|error| AppError::Message(format!("无法访问 macOS Keychain：{error}")))
 }
 
-fn api_base_url_entry() -> Result<keyring::Entry, AppError> {
-  keyring::Entry::new("com.xtnntn.nihongo-daily-reader", "openai-compatible-base-url")
-    .map_err(|error| AppError::Message(format!("无法访问 macOS Keychain：{error}")))
+fn local_ai_settings_path() -> Result<PathBuf, AppError> {
+  let home = std::env::var_os("HOME").ok_or_else(|| AppError::Message("无法定位用户目录".into()))?;
+  Ok(PathBuf::from(home).join("Library/Application Support/com.xtnntn.nihongo-daily-reader/ai-settings.json"))
 }
 
-fn model_entry() -> Result<keyring::Entry, AppError> {
-  keyring::Entry::new("com.xtnntn.nihongo-daily-reader", "openai-compatible-model")
-    .map_err(|error| AppError::Message(format!("无法访问 macOS Keychain：{error}")))
+fn load_local_ai_settings() -> LocalAiSettings {
+  local_ai_settings_path().ok().and_then(|path| fs::read_to_string(path).ok())
+    .and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default()
 }
 
-fn protocol_entry() -> Result<keyring::Entry, AppError> {
-  keyring::Entry::new("com.xtnntn.nihongo-daily-reader", "openai-compatible-protocol")
-    .map_err(|error| AppError::Message(format!("无法访问 macOS Keychain：{error}")))
+fn local_ai_settings() -> LocalAiSettings {
+  LOCAL_AI_SETTINGS.get_or_init(|| Mutex::new(load_local_ai_settings())).lock()
+    .map(|settings| settings.clone()).unwrap_or_default()
+}
+
+fn save_local_ai_settings(settings: LocalAiSettings) -> Result<(), AppError> {
+  let path = local_ai_settings_path()?;
+  if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|error| AppError::Message(format!("无法保存 AI 设置：{error}")))?; }
+  fs::write(&path, serde_json::to_string(&settings).map_err(|error| AppError::Message(format!("无法编码 AI 设置：{error}")))?)
+    .map_err(|error| AppError::Message(format!("无法保存 AI 设置：{error}")))?;
+  if let Ok(mut cached) = LOCAL_AI_SETTINGS.get_or_init(|| Mutex::new(LocalAiSettings::default())).lock() { *cached = settings; }
+  Ok(())
 }
 
 fn keychain_fallback_password(account: &str) -> Option<String> {
@@ -384,32 +397,43 @@ fn keychain_fallback_password(account: &str) -> Option<String> {
   String::from_utf8(output.stdout).ok().map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
 }
 
+fn cached_keychain_password(
+  cache: &OnceLock<Mutex<Option<String>>>,
+  account: &str,
+  entry: Result<keyring::Entry, AppError>,
+) -> Option<String> {
+  let cache = cache.get_or_init(|| Mutex::new(None));
+  if let Ok(guard) = cache.lock() {
+    if let Some(value) = guard.clone() { return Some(value); }
+  }
+  let value = entry.ok().and_then(|entry| entry.get_password().ok()).filter(|value| !value.trim().is_empty())
+    .or_else(|| keychain_fallback_password(account));
+  if let Some(value) = value.as_ref() {
+    if let Ok(mut guard) = cache.lock() { *guard = Some(value.clone()); }
+  }
+  value
+}
+
+fn cache_password(cache: &OnceLock<Mutex<Option<String>>>, value: String) {
+  if let Ok(mut guard) = cache.get_or_init(|| Mutex::new(None)).lock() { *guard = Some(value); }
+}
+
 fn get_api_key() -> Option<String> {
-  api_key_entry().ok().and_then(|entry| entry.get_password().ok()).filter(|key| !key.trim().is_empty())
-    .or_else(|| keychain_fallback_password("openai-api-key"))
+  cached_keychain_password(&API_KEY_CACHE, "openai-api-key", api_key_entry())
 }
 
 fn get_base_url() -> String {
-  api_base_url_entry()
-    .ok()
-    .and_then(|entry| entry.get_password().ok())
-    .filter(|url| !url.trim().is_empty())
-    .or_else(|| keychain_fallback_password("openai-compatible-base-url"))
+  local_ai_settings().base_url
     .unwrap_or_else(|| "https://api.openai.com/v1".into())
 }
 
 fn get_model() -> String {
-  model_entry()
-    .ok()
-    .and_then(|entry| entry.get_password().ok())
-    .filter(|model| !model.trim().is_empty())
-    .or_else(|| keychain_fallback_password("openai-compatible-model"))
+  local_ai_settings().model
     .unwrap_or_else(|| "gpt-5.6-luna".into())
 }
 
 fn get_protocol() -> String {
-  protocol_entry().ok().and_then(|entry| entry.get_password().ok())
-    .or_else(|| keychain_fallback_password("openai-compatible-protocol"))
+  local_ai_settings().protocol
     .filter(|protocol| matches!(protocol.as_str(), "responses" | "chat_completions"))
     .unwrap_or_else(|| "responses".into())
 }
@@ -532,24 +556,14 @@ fn explanation_schema() -> serde_json::Value {
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "japaneseHint": { "type": "string" },
-      "chineseTranslation": { "type": "string" },
-      "furigana": { "type": "string" },
-      "note": { "type": "string" }
+      "reading": { "type": "string" },
+      "translation": { "type": "string" },
+      "contextNote": { "type": "string" },
+      "example": { "type": "string" },
+      "exampleTranslation": { "type": "string" },
+      "grammarNote": { "type": "string" }
     },
-    "required": ["japaneseHint", "chineseTranslation", "furigana", "note"]
-  })
-}
-
-fn deep_explanation_schema() -> serde_json::Value {
-  serde_json::json!({
-    "type": "object", "additionalProperties": false,
-    "properties": {
-      "japaneseDetails": { "type": "string" },
-      "grammarPoints": { "type": "array", "maxItems": 3, "items": { "type": "string" } },
-      "chineseDetails": { "type": "string" }
-    },
-    "required": ["japaneseDetails", "grammarPoints", "chineseDetails"]
+    "required": ["reading", "translation", "contextNote", "example", "exampleTranslation", "grammarNote"]
   })
 }
 
@@ -800,10 +814,6 @@ async fn fetch_kaiyou_candidates() -> Result<Vec<TitleCandidate>, AppError> {
   Ok(candidates)
 }
 
-async fn fetch_kaiyou_article() -> Result<Article, AppError> {
-  fetch_kaiyou_article_excluding(&HashSet::new()).await
-}
-
 async fn fetch_personalized_kaiyou_article(db_path: &PathBuf) -> Result<Article, AppError> {
   let exploration = matches!(Local::now().weekday(), chrono::Weekday::Tue | chrono::Weekday::Fri);
   let fetched_candidates = fetch_kaiyou_candidates().await?;
@@ -975,57 +985,29 @@ async fn explain_selection(
   article_id: String,
   selection: String,
   context: String,
-  chinese_revealed: bool,
  ) -> Result<Explanation, AppError> {
-  if chinese_revealed {
-    let conn = open_db(&state)?;
-    conn.execute(
-      "UPDATE selections SET chinese_revealed = 1 WHERE id = (
-         SELECT id FROM selections WHERE article_id = ?1 AND selection = ?2 ORDER BY created_at DESC LIMIT 1
-       )",
-      params![article_id, selection],
-    )?;
-  } else {
-    let conn = open_db(&state)?;
-    conn.execute(
-      "INSERT INTO selections (id, article_id, selection, context, chinese_revealed, created_at)
-       VALUES (?1, ?2, ?3, ?4, 0, ?5)",
-      params![Uuid::new_v4().to_string(), article_id, selection, context, Local::now().to_rfc3339()],
-    )?;
-  }
+  let conn = open_db(&state)?;
+  conn.execute(
+    "INSERT INTO selections (id, article_id, selection, context, chinese_revealed, created_at)
+     VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+    params![Uuid::new_v4().to_string(), article_id, selection, context, Local::now().to_rfc3339()],
+  )?;
 
   let selection = selection.trim();
   if let Some(api_key) = get_api_key() {
-    let system = "你是面向中国母语者的日语阅读教练。用户正在阅读真实日文文章。先提供极短、明显低于原文难度的日语语境提示；中文翻译仅作为用户主动展开后的安全网，但仍必须生成。日语提示中出现汉字时，请在 furigana 字段给出含假名读音的同义提示。不要长篇讲解，不要编造原文没有的信息。";
+    let system = "你是面向中国母语者的日语阅读教练。用户划选了真实日文文章中的一段。不要输出日语释义。所有 translation、contextNote、exampleTranslation、grammarNote 必须用简洁中文。reading 必须完整复现用户划选文本，并为其中每个汉字词补括号假名，例如「文化祭（ぶんかさい）のような」；绝不使用罗马音，不能遗漏读音。translation 必须结合完整上下文，而不是孤立词典义。example 给一个自然的日语例句来帮助理解；grammarNote 用中文说明相关语法或搭配，没有必要时写“无特殊语法，注意语境搭配”。不要编造原文事实，所有字段保持简短。";
     let user = format!(
-      "选中的文本：{selection}\n完整所在句/上下文：{context}\n用户是否已主动展开中文：{chinese_revealed}"
+      "划选文本：{selection}\n完整所在句/上下文：{context}"
     );
     return generate_structured(&api_key, system, &user, "selection_explanation", explanation_schema()).await;
   }
-  let hint = if selection.chars().count() <= 8 {
-    format!("この文では「{}」は、前後の内容を理解するための大切な表現です。", selection)
-  } else {
-    "選んだ部分が、だれが何をしたか、または筆者の考えを説明しているか確認しましょう。".into()
-  };
   Ok(Explanation {
-    japanese_hint: hint,
-    chinese_translation: "这里应结合前后文理解。配置 OpenAI API Key 后，应用会生成针对该句的中文翻译与语法说明。".into(),
-    furigana: "ヒントを読（よ）んでから、必要（ひつよう）なときだけ中国語（ちゅうごくご）を開（ひら）きましょう。".into(),
-    note: "本地降级解释：尚未配置 OpenAI API Key。".into(),
-  })
-}
-
-#[tauri::command]
-async fn explain_deeper(selection: String, context: String) -> Result<DeepExplanation, AppError> {
-  if let Some(api_key) = get_api_key() {
-    let system = "你是日语阅读教练。用户已主动请求深入解释，因此可以比划词第一屏更详细，但总长度仍要克制。先用容易的日语解释语境和语法，日语汉字用括号标假名；列出最多三个真正相关的语法或搭配点；最后给简短中文说明。不要引入原文外事实。";
-    let user = format!("选中文本：{}\n所在上下文：{}", selection.trim(), context.trim());
-    return generate_structured(&api_key, system, &user, "deep_selection_explanation", deep_explanation_schema()).await;
-  }
-  Ok(DeepExplanation {
-    japanese_details: "前後（ぜんご）の文（ぶん）で、この表現（ひょうげん）が説明（せつめい）・理由（りゆう）・評価（ひょうか）のどれを表（あらわ）すか確認（かくにん）してください。".into(),
-    grammar_points: vec!["AI設定後（せっていご）、文脈（ぶんみゃく）に合（あ）わせた文法（ぶんぽう）説明（せつめい）を表示（ひょうじ）します。".into()],
-    chinese_details: "当前为本地降级说明。配置 AI 后会结合完整上下文解释语法和搭配。".into(),
+    reading: format!("{selection}（需要配置 AI 才能生成准确假名读音）"),
+    translation: "当前未配置 AI，无法生成结合上下文的准确译文。".into(),
+    context_note: "请先配置 AI，再重新划选该片段。".into(),
+    example: "例句需要结合具体表达生成。".into(),
+    example_translation: "配置 AI 后会给出对应例句翻译。".into(),
+    grammar_note: "配置 AI 后会补充相关语法或搭配。".into(),
   })
 }
 
@@ -1096,16 +1078,14 @@ fn save_openai_api_key(api_key: String, base_url: String, model: String, protoco
     api_key_entry()?
       .set_password(cleaned)
       .map_err(|error| AppError::Message(format!("无法保存到 macOS Keychain：{error}")))?;
+    cache_password(&API_KEY_CACHE, cleaned.to_owned());
   }
-  api_base_url_entry()?
-    .set_password(normalized_base_url)
-    .map_err(|error| AppError::Message(format!("无法保存到 macOS Keychain：{error}")))?;
-  model_entry()?
-    .set_password(normalized_model)
-    .map_err(|error| AppError::Message(format!("无法保存到 macOS Keychain：{error}")))?;
-  protocol_entry()?
-    .set_password(normalized_protocol)
-    .map_err(|error| AppError::Message(format!("无法保存到 macOS Keychain：{error}")))
+  save_local_ai_settings(LocalAiSettings {
+    base_url: Some(normalized_base_url.to_owned()),
+    model: Some(normalized_model.to_owned()),
+    protocol: Some(normalized_protocol.to_owned()),
+  })?;
+  Ok(())
 }
 
 #[tauri::command]
@@ -1431,7 +1411,10 @@ pub fn run() {
         let db_path = data_dir.join("learning.sqlite3");
         let mut title = Connection::open(&db_path).ok().and_then(|conn| conn.query_row("SELECT title FROM articles WHERE day = date('now', 'localtime') ORDER BY rowid DESC LIMIT 1", [], |row| row.get::<_, String>(0)).ok());
         if title.is_none() {
-          if let Ok(article) = tauri::async_runtime::block_on(fetch_kaiyou_article()) {
+          // The reminder may be the first process to create today's task. It must use the
+          // same history-aware selection path as the reader; otherwise it can re-save
+          // yesterday's top homepage article before the main app has a chance to filter it.
+          if let Ok(article) = tauri::async_runtime::block_on(fetch_personalized_kaiyou_article(&db_path)) {
             if let Ok(conn) = Connection::open(&db_path) {
               let _ = save_article(&conn, &article);
               title = Some(article.title);
@@ -1453,7 +1436,6 @@ pub fn run() {
       get_weekly_assessment,
       submit_weekly_assessment,
       explain_selection,
-      explain_deeper,
       get_ai_status,
       discover_models,
       save_openai_api_key,

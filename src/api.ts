@@ -15,12 +15,13 @@ export type Article = {
 };
 
 export type Explanation = {
-  japaneseHint: string;
-  chineseTranslation: string;
-  furigana: string;
-  note: string;
+  reading: string;
+  translation: string;
+  contextNote: string;
+  example: string;
+  exampleTranslation: string;
+  grammarNote: string;
 };
-export type DeepExplanation = { japaneseDetails: string; grammarPoints: string[]; chineseDetails: string };
 
 export type Question = {
   id: string;
@@ -58,9 +59,8 @@ export type AiStatus = { configured: boolean; model: string; baseUrl: string; pr
 
 export const api = {
   getTodayArticle: () => invoke<Article>("get_today_article"),
-  explainSelection: (articleId: string, selection: string, context: string, chineseRevealed = false) =>
-    invoke<Explanation>("explain_selection", { articleId, selection, context, chineseRevealed }),
-  explainDeeper: (selection: string, context: string) => invoke<DeepExplanation>("explain_deeper", { selection, context }),
+  explainSelection: (articleId: string, selection: string, context: string) =>
+    invoke<Explanation>("explain_selection", { articleId, selection, context }),
   getQuestions: (article: Article) => invoke<Question[]>("get_questions", { article }),
   recordAnswer: (articleId: string, questionId: string, chosenIndex: number, answerIndex: number, testedExpressions: string[]) =>
     invoke<boolean>("record_answer", { articleId, questionId, chosenIndex, answerIndex, testedExpressions }),
