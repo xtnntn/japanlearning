@@ -59,6 +59,7 @@ export type AiStatus = { configured: boolean; model: string; baseUrl: string; pr
 
 export const api = {
   getTodayArticle: () => invoke<Article>("get_today_article"),
+  refreshTodayArticle: () => invoke<Article>("refresh_today_article"),
   explainSelection: (articleId: string, selection: string, context: string) =>
     invoke<Explanation>("explain_selection", { articleId, selection, context }),
   getQuestions: (article: Article) => invoke<Question[]>("get_questions", { article }),

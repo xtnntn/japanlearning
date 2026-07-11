@@ -980,6 +980,37 @@ async fn get_today_article(state: State<'_, AppState>) -> Result<Article, AppErr
 }
 
 #[tauri::command]
+async fn refresh_today_article(state: State<'_, AppState>) -> Result<Article, AppError> {
+  let today = Local::now().format("%Y-%m-%d").to_string();
+  let current = {
+    let conn = open_db(&state)?;
+    conn.query_row(
+      "SELECT id, completed_at FROM articles WHERE day = ?1 ORDER BY rowid DESC LIMIT 1",
+      params![&today],
+      |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    ).optional()?
+  };
+  let Some((current_id, completed_at)) = current else {
+    return get_today_article(state).await;
+  };
+  if completed_at.is_some() {
+    return Err(AppError::Message("今天的日报已经完成，不能刷新，以免破坏学习记录。".into()));
+  }
+
+  // Fetch before removing the current task. If no suitable unseen article is available,
+  // the user keeps the existing one instead of receiving an empty reader.
+  let db_path = state.db_path.lock().map_err(|_| AppError::Message("无法访问本地学习数据库".into()))?.clone();
+  let replacement = fetch_personalized_kaiyou_article(&db_path).await?;
+  let conn = open_db(&state)?;
+  conn.execute("DELETE FROM selections WHERE article_id = ?1", params![&current_id])?;
+  conn.execute("DELETE FROM topic_feedback WHERE article_id = ?1", params![&current_id])?;
+  conn.execute("DELETE FROM answers WHERE article_id = ?1", params![&current_id])?;
+  conn.execute("DELETE FROM articles WHERE id = ?1", params![&current_id])?;
+  save_article(&conn, &replacement)?;
+  Ok(replacement)
+}
+
+#[tauri::command]
 async fn explain_selection(
   state: State<'_, AppState>,
   article_id: String,
@@ -1429,6 +1460,7 @@ pub fn run() {
     })
     .invoke_handler(tauri::generate_handler![
       get_today_article,
+      refresh_today_article,
       get_title_candidates,
       save_title_vote,
       get_initial_assessment,

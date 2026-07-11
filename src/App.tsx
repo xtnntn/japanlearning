@@ -16,6 +16,8 @@ export default function App() {
   const [aiStatus, setAiStatus] = useState<AiStatus>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
+  const [refreshingDaily, setRefreshingDaily] = useState(false);
+  const [dailyRefreshMessage, setDailyRefreshMessage] = useState<string>();
   const [selection, setSelection] = useState<SelectionState>();
   const [explanation, setExplanation] = useState<Explanation>();
   const [explanationError, setExplanationError] = useState<string>();
@@ -119,6 +121,29 @@ export default function App() {
     void api.explainSelection(article.id, text, context)
       .then((result) => { setExplanation(result); void api.getProgress().then(setProgress); })
       .catch((reason) => setExplanationError(String(reason)));
+  };
+
+  const refreshDaily = async () => {
+    if (completed || refreshingDaily) return;
+    setRefreshingDaily(true);
+    setDailyRefreshMessage(undefined);
+    try {
+      const nextArticle = await api.refreshTodayArticle();
+      setArticle(nextArticle);
+      setSelection(undefined);
+      setExplanation(undefined);
+      setExplanationError(undefined);
+      setQuestions([]);
+      setQuestionIndex(0);
+      setAnswerState(undefined);
+      setFeedback(undefined);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      void api.getProgress().then(setProgress);
+    } catch (reason) {
+      setDailyRefreshMessage(String(reason));
+    } finally {
+      setRefreshingDaily(false);
+    }
   };
 
   const finishReading = async () => {
@@ -318,7 +343,12 @@ export default function App() {
         <button className="settings-button" onClick={() => void openWeeklyAssessment()}>本周独立评估</button>
         <button className="settings-button" onClick={() => setShowProgress(true)}>进步曲线</button>
         <button className="settings-button" onClick={() => void openProfile()}>能力画像</button>
+        <button className="settings-button" onClick={() => void refreshDaily()} disabled={completed || refreshingDaily} title={completed ? "完成后日报不可更换" : "换一篇未读日报"}>
+          {refreshingDaily ? "正在刷新…" : "刷新日报"}
+        </button>
       </header>
+
+      {dailyRefreshMessage && <p className="daily-refresh-message">{dailyRefreshMessage}</p>}
 
       <section className="article-layout">
         <aside className="article-meta">

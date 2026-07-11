@@ -14,6 +14,8 @@ h1 { margin: 0; font-size: 34px; letter-spacing: -.03em; }
 .metric-card strong { display: block; margin-top: 5px; font-size: 14px; }
 .metric-card small { display: block; margin-top: 5px; color: #8a8e85; font-size: 11px; }
 .settings-button { padding: 10px 13px; border: 1px solid #d9d5c8; border-radius: 8px; color: #315e50; background: #fbfaf5; }
+.settings-button:disabled { cursor: default; opacity: .55; }
+.daily-refresh-message { width: min(1080px, calc(100vw - 64px)); margin: 12px auto 0; color: #8c4035; font-size: 13px; }
 .article-layout { display: grid; grid-template-columns: 180px minmax(620px, 760px); justify-content: center; gap: 42px; }
 .article-meta { display: flex; flex-direction: column; gap: 11px; padding-top: 34px; color: #6e7269; font-size: 13px; }
 .article-meta .source { color: #315e50; font-weight: 700; }
