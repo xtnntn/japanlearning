@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, type AiStatus, type Article, type AssessmentQuestion, type AssessmentResult, type Explanation, type Progress, type Question, type TitleCandidate } from "./api";
+import { api, type AbilityProfile, type AiStatus, type Article, type AssessmentQuestion, type AssessmentResult, type DeepExplanation, type Explanation, type Progress, type Question, type ReminderStatus, type TitleCandidate, type WeeklyAssessment } from "./api";
 
 const feedbackOptions = [
   "想多读这个题材",
@@ -18,14 +18,30 @@ export default function App() {
   const [error, setError] = useState<string>();
   const [selection, setSelection] = useState<SelectionState>();
   const [explanation, setExplanation] = useState<Explanation>();
+  const [deepExplanation, setDeepExplanation] = useState<DeepExplanation>();
+  const [deepLoading, setDeepLoading] = useState(false);
+  const [deepError, setDeepError] = useState<string>();
   const [showChinese, setShowChinese] = useState(false);
   const [questions, setQuestions] = useState<Question[]>([]);
   const [questionIndex, setQuestionIndex] = useState(0);
   const [answerState, setAnswerState] = useState<{ chosen: number; correct: boolean }>();
   const [completed, setCompleted] = useState(false);
+  const [quizError, setQuizError] = useState<string>();
   const [feedback, setFeedback] = useState<string>();
   const [showSettings, setShowSettings] = useState(false);
+  const [showProgress, setShowProgress] = useState(false);
+  const [showProfile, setShowProfile] = useState(false);
+  const [abilityProfile, setAbilityProfile] = useState<AbilityProfile>();
+  const [targetLevel, setTargetLevel] = useState("");
+  const [profileMessage, setProfileMessage] = useState<string>();
+  const [reminder, setReminder] = useState<ReminderStatus>({ enabled: false, hour: 9, minute: 0 });
+  const [reminderTime, setReminderTime] = useState("09:00");
+  const [reminderMessage, setReminderMessage] = useState<string>();
   const [apiKey, setApiKey] = useState("");
+  const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
+  const [model, setModel] = useState("gpt-5.6-luna");
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [detectingModels, setDetectingModels] = useState(false);
   const [keyMessage, setKeyMessage] = useState<string>();
   const [candidates, setCandidates] = useState<TitleCandidate[]>([]);
   const [candidateIndex, setCandidateIndex] = useState(0);
@@ -35,7 +51,14 @@ export default function App() {
   const [initialIndex, setInitialIndex] = useState(0);
   const [initialAnswers, setInitialAnswers] = useState<number[]>([]);
   const [initialResult, setInitialResult] = useState<AssessmentResult>();
+  const [weeklyAssessment, setWeeklyAssessment] = useState<WeeklyAssessment>();
+  const [showWeeklyAssessment, setShowWeeklyAssessment] = useState(false);
+  const [weeklyQuestionIndex, setWeeklyQuestionIndex] = useState(-1);
+  const [weeklyAnswers, setWeeklyAnswers] = useState<number[]>([]);
+  const [weeklyResult, setWeeklyResult] = useState<AssessmentResult>();
   const readerRef = useRef<HTMLElement>(null);
+  const finishRef = useRef<HTMLDivElement>(null);
+  const generatingQuestionsRef = useRef(false);
 
   const currentQuestion = questions[questionIndex];
   const selectionRateHint = useMemo(() => {
@@ -44,11 +67,16 @@ export default function App() {
   }, [progress, article]);
 
   useEffect(() => {
-    void Promise.all([api.getTodayArticle(), api.getProgress(), api.getAiStatus()])
-      .then(([nextArticle, nextProgress, status]) => {
+    void Promise.all([api.getTodayArticle(), api.getProgress(), api.getAiStatus(), api.getReminderStatus()])
+      .then(([nextArticle, nextProgress, status, reminderStatus]) => {
         setArticle(nextArticle);
         setProgress(nextProgress);
         setAiStatus(status);
+        setBaseUrl(status.baseUrl);
+        setModel(status.model);
+        setAvailableModels([status.model]);
+        setReminder(reminderStatus);
+        setReminderTime(`${String(reminderStatus.hour).padStart(2, "0")}:${String(reminderStatus.minute).padStart(2, "0")}`);
         if (nextProgress.titleVotes === 0) {
           void api.getTitleCandidates().then((items) => {
             setCandidates(items);
@@ -75,6 +103,8 @@ export default function App() {
     const context = range.commonAncestorContainer.parentElement?.closest("p")?.textContent ?? text;
     setSelection({ text, context, x: rect.left + rect.width / 2, y: rect.bottom + 12 });
     setExplanation(undefined);
+    setDeepExplanation(undefined);
+    setDeepError(undefined);
     setShowChinese(false);
     void api.explainSelection(article.id, text, context).then((result) => {
       setExplanation(result);
@@ -91,18 +121,44 @@ export default function App() {
     });
   };
 
-  const finishReading = async () => {
-    if (!article || completed) return;
-    await api.completeArticle(article.id);
-    const generatedQuestions = await api.getQuestions(article);
-    setQuestions(generatedQuestions);
-    setCompleted(true);
-    void api.getProgress().then(setProgress);
+  const loadDeepExplanation = async () => {
+    if (!selection || deepLoading) return;
+    setDeepLoading(true);
+    try { setDeepExplanation(await api.explainDeeper(selection.text, selection.context)); }
+    catch (reason) { setDeepError(String(reason)); }
+    finally { setDeepLoading(false); }
   };
+
+  const finishReading = async () => {
+    if (!article || completed || generatingQuestionsRef.current) return;
+    generatingQuestionsRef.current = true;
+    setQuizError(undefined);
+    try {
+      await api.completeArticle(article.id);
+      const generatedQuestions = await api.getQuestions(article);
+      setQuestions(generatedQuestions);
+      setCompleted(true);
+      void api.getProgress().then(setProgress);
+    } catch (reason) {
+      setQuizError(String(reason));
+    } finally {
+      generatingQuestionsRef.current = false;
+    }
+  };
+
+  useEffect(() => {
+    const target = finishRef.current;
+    if (!target || completed) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) void finishReading();
+    }, { threshold: 0.75 });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [article?.id, completed]);
 
   const answerQuestion = async (index: number) => {
     if (!article || !currentQuestion || answerState) return;
-    const correct = await api.recordAnswer(article.id, currentQuestion.id, index, currentQuestion.answerIndex);
+    const correct = await api.recordAnswer(article.id, currentQuestion.id, index, currentQuestion.answerIndex, currentQuestion.testedExpressions);
     setAnswerState({ chosen: index, correct });
   };
 
@@ -122,14 +178,67 @@ export default function App() {
 
   const saveKey = async () => {
     try {
-      await api.saveOpenAiApiKey(apiKey);
+      await api.saveOpenAiApiKey(apiKey, baseUrl, model);
       const status = await api.getAiStatus();
       setAiStatus(status);
       setApiKey("");
-      setKeyMessage("已安全保存到 macOS Keychain。下次划词会使用真实 AI 解释。");
+      setBaseUrl(status.baseUrl);
+      setModel(status.model);
+      setKeyMessage("Base URL、模型和 Key 已保存到 macOS Keychain。下次划词会使用所选模型。");
     } catch (reason) {
       setKeyMessage(String(reason));
     }
+  };
+
+  const detectModels = async () => {
+    setDetectingModels(true);
+    setKeyMessage(undefined);
+    try {
+      const discovered = await api.discoverModels(baseUrl, apiKey);
+      setAvailableModels(discovered);
+      setModel(discovered.includes(model) ? model : discovered[0]);
+      setKeyMessage(`已检测到 ${discovered.length} 个模型，请选择一个后保存。`);
+    } catch (reason) {
+      setAvailableModels([]);
+      setKeyMessage(String(reason));
+    } finally {
+      setDetectingModels(false);
+    }
+  };
+
+  const saveReminder = async () => {
+    const [hour, minute] = reminderTime.split(":").map(Number);
+    try {
+      const status = await api.installDailyReminder(hour, minute);
+      setReminder(status);
+      setReminderMessage(`已启用，每天 ${reminderTime} 提醒。`);
+    } catch (reason) { setReminderMessage(String(reason)); }
+  };
+
+  const disableReminder = async () => {
+    try {
+      setReminder(await api.removeDailyReminder());
+      setReminderMessage("每日提醒已关闭。");
+    } catch (reason) { setReminderMessage(String(reason)); }
+  };
+
+  const openProfile = async () => {
+    try {
+      const profile = await api.getAbilityProfile();
+      setAbilityProfile(profile);
+      setTargetLevel(profile.targetLevel ?? "");
+      setProfileMessage(undefined);
+      setShowProfile(true);
+    } catch (reason) { setError(String(reason)); }
+  };
+
+  const saveTargetLevel = async () => {
+    try {
+      const profile = await api.updateTargetLevel(targetLevel || undefined);
+      setAbilityProfile(profile);
+      setTargetLevel(profile.targetLevel ?? "");
+      setProfileMessage("目标难度已保存，将从下一篇文章开始生效。");
+    } catch (reason) { setProfileMessage(String(reason)); }
   };
 
   const voteForTitle = async (vote: string) => {
@@ -161,6 +270,35 @@ export default function App() {
     void api.getProgress().then(setProgress);
   };
 
+  const openWeeklyAssessment = async () => {
+    try {
+      const assessment = await api.getWeeklyAssessment();
+      setWeeklyAssessment(assessment);
+      setWeeklyResult(assessment.result);
+      setWeeklyQuestionIndex(assessment.completed ? assessment.questions.length : -1);
+      setWeeklyAnswers([]);
+      setShowWeeklyAssessment(true);
+    } catch (reason) {
+      setError(String(reason));
+    }
+  };
+
+  const startWeeklyQuestions = () => setWeeklyQuestionIndex(0);
+
+  const answerWeeklyQuestion = async (answer: number) => {
+    if (!weeklyAssessment || weeklyQuestionIndex < 0) return;
+    const answers = [...weeklyAnswers, answer];
+    setWeeklyAnswers(answers);
+    if (weeklyQuestionIndex + 1 < weeklyAssessment.questions.length) {
+      setWeeklyQuestionIndex((index) => index + 1);
+      return;
+    }
+    const result = await api.submitWeeklyAssessment(weeklyAssessment.id, answers);
+    setWeeklyResult(result);
+    setWeeklyAssessment({ ...weeklyAssessment, completed: true, result });
+    void api.getProgress().then(setProgress);
+  };
+
   if (loading) return <main className="loading">正在准备今天唯一的一篇阅读…</main>;
   if (error || !article) return <main className="loading error">启动失败：{error ?? "没有可用文章"}</main>;
 
@@ -172,10 +310,20 @@ export default function App() {
           <h1>今天只读这一篇</h1>
         </div>
         <div className="metric-card">
-          <span>阅读辅助趋势</span>
-          <strong>{selectionRateHint}</strong>
+          <span>旧表达独立理解率</span>
+          <strong>{progress?.independentExpressionRate == null ? "正在建立证据" : `${Math.round(progress.independentExpressionRate * 100)}%`}</strong>
+          <small>{progress?.independentExpressionAttempts ?? 0} 次新语境验证</small>
+          <small>{selectionRateHint}</small>
+          <small>{progress?.completedArticles ?? 0} 篇完成 · {progress?.missedArticles ?? 0} 篇过期</small>
         </div>
-        <button className="settings-button" onClick={() => setShowSettings(true)}>AI 设置</button>
+        <button className="settings-button" onClick={() => {
+          setBaseUrl(aiStatus?.baseUrl ?? "https://api.openai.com/v1");
+          setModel(aiStatus?.model ?? "gpt-5.6-luna");
+          setShowSettings(true);
+        }}>AI 设置</button>
+        <button className="settings-button" onClick={() => void openWeeklyAssessment()}>本周独立评估</button>
+        <button className="settings-button" onClick={() => setShowProgress(true)}>进步曲线</button>
+        <button className="settings-button" onClick={() => void openProfile()}>能力画像</button>
       </header>
 
       <section className="article-layout">
@@ -195,10 +343,15 @@ export default function App() {
             <p>{paragraph}</p>
             {index < article.images.length && <a className="article-image-link" href={article.url} target="_blank" rel="noreferrer"><img src={article.images[index]} alt="来源文章配图" referrerPolicy="no-referrer" /></a>}
           </section>)}
-          <div className="finish-zone">
-            <p>已读到文章结尾。</p>
+          {article.embeds.length > 0 && <section className="article-embeds">
+            {article.embeds.map((embed) => embed.kind === "video" && embed.url.includes("youtube.com/embed/")
+              ? <iframe key={embed.url} src={embed.url} title="来源文章视频" loading="lazy" allowFullScreen />
+              : <a key={embed.url} href={embed.url} target="_blank" rel="noreferrer">查看来源文章中的社媒或视频内容 ↗</a>)}
+          </section>}
+          <div className="finish-zone" ref={finishRef}>
+            <p>{completed ? "已到达文末，理解题已出现。" : quizError ? `理解题准备失败：${quizError}` : "到达这里会自动准备理解题。"}</p>
             <button onClick={() => void finishReading()} disabled={completed}>
-              {completed ? "已进入理解题" : "完成阅读，开始理解题"}
+              {completed ? "已进入理解题" : "没有自动出现？点击重试"}
             </button>
           </div>
         </article>
@@ -213,6 +366,13 @@ export default function App() {
             <p className="furigana">{explanation.furigana}</p>
             {showChinese ? <p className="chinese">{explanation.chineseTranslation}</p> : <button className="text-button" onClick={revealChinese}>需要时展开中文翻译</button>}
             <small>{explanation.note}</small>
+            {!deepExplanation && <button className="deep-button" onClick={() => void loadDeepExplanation()} disabled={deepLoading}>{deepLoading ? "正在深入解释…" : "深入解释"}</button>}
+            {deepExplanation && <div className="deep-explanation">
+              <p>{deepExplanation.japaneseDetails}</p>
+              {deepExplanation.grammarPoints.map((point) => <p key={point}>・{point}</p>)}
+              <p className="chinese">{deepExplanation.chineseDetails}</p>
+            </div>}
+            {deepError && <small className="inline-error">深入解释失败：{deepError}</small>}
           </> : <p className="thinking">正在生成受控难度的日语提示…</p>}
         </section>
       )}
@@ -220,13 +380,111 @@ export default function App() {
       {showSettings && <section className="settings-modal">
         <div className="settings-card">
           <button className="close" onClick={() => setShowSettings(false)} aria-label="关闭">×</button>
-          <p className="eyebrow">OpenAI Responses API</p>
+          <p className="eyebrow">OpenAI 兼容 Responses API</p>
           <h3>AI 解释设置</h3>
           <p>当前状态：{aiStatus?.configured ? `已配置（${aiStatus.model}）` : "未配置，本地降级解释中"}</p>
-          <input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="粘贴 OpenAI API Key" autoComplete="off" />
-          <button className="save-key" onClick={() => void saveKey()} disabled={!apiKey.trim()}>保存到 macOS Keychain</button>
-          <small>Key 不会写入文章数据库或 React 前端文件；仅由本机 Rust 进程从 Keychain 读取。</small>
+          <label className="field-label" htmlFor="base-url">Base URL</label>
+          <input id="base-url" type="url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setAvailableModels([]); }} placeholder="https://api.openai.com/v1" autoComplete="url" />
+          <label className="field-label" htmlFor="api-key">API Key</label>
+          <input id="api-key" type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setAvailableModels([]); }} placeholder={aiStatus?.configured ? "已安全保存；仅在替换 Key 时输入" : "粘贴 API Key"} autoComplete="off" />
+          <button className="detect-models" onClick={() => void detectModels()} disabled={!baseUrl.trim() || (!apiKey.trim() && !aiStatus?.configured) || detectingModels}>{detectingModels ? "正在检测模型…" : "检测可用模型"}</button>
+          <label className="field-label" htmlFor="model">模型</label>
+          <select id="model" value={model} onChange={(event) => setModel(event.target.value)} disabled={availableModels.length === 0}>
+            {availableModels.length === 0 ? <option>请先检测可用模型</option> : availableModels.map((name) => <option key={name} value={name}>{name}</option>)}
+          </select>
+          <button className="save-key" onClick={() => void saveKey()} disabled={!baseUrl.trim() || availableModels.length === 0 || (!apiKey.trim() && !aiStatus?.configured)}>保存设置到 macOS Keychain</button>
+          <small>已保存过 Key 时，留空即可复用 Keychain 中的密钥；只在替换密钥时重新输入。检测会请求 <code>Base URL/models</code>，程序随后调用同一服务的 <code>/responses</code>。</small>
           {keyMessage && <p className="key-message">{keyMessage}</p>}
+          <div className="settings-divider" />
+          <p className="eyebrow">每日阅读提醒</p>
+          <p>当前状态：{reminder.enabled ? `已启用（${String(reminder.hour).padStart(2, "0")}:${String(reminder.minute).padStart(2, "0")}）` : "未启用"}</p>
+          <label className="field-label" htmlFor="reminder-time">提醒时间</label>
+          <input id="reminder-time" type="time" value={reminderTime} onChange={(event) => setReminderTime(event.target.value)} />
+          <div className="reminder-actions">
+            {reminder.enabled && <button className="secondary-action" onClick={() => void disableReminder()}>关闭提醒</button>}
+            <button className="save-key" onClick={() => void saveReminder()}>{reminder.enabled ? "更新时间" : "启用提醒"}</button>
+          </div>
+          {reminderMessage && <p className="key-message">{reminderMessage}</p>}
+        </div>
+      </section>}
+
+      {showProgress && <section className="settings-modal">
+        <div className="settings-card progress-card">
+          <button className="close" onClick={() => setShowProgress(false)} aria-label="关闭">×</button>
+          <p className="eyebrow">最近 14 天</p>
+          <h3>阅读辅助依赖</h3>
+          <div className={`experiment-status ${progress?.experiment.readyForVerdict ? "ready" : "collecting"}`}>
+            <div><span>两周试验</span><strong>{progress?.experiment.verdict ?? "证据积累中"}</strong></div>
+            <small>观察第 {progress?.experiment.observedDays ?? 0} 天 · 有效阅读 {progress?.experiment.completedDays ?? 0} 天</small>
+            <ul>
+              <li>归一化划词频率：{progress?.experiment.selectionRateChange == null ? "至少需要 6 篇完成文章" : progress.experiment.selectionRateChange < 0 ? "下降中" : "尚未下降"}</li>
+              <li>无辅助周测：{progress?.experiment.weeklyScoreNonDeclining == null ? "至少需要 2 次周测" : progress.experiment.weeklyScoreNonDeclining ? "未下降" : "出现下降"}</li>
+              <li>旧表达独立理解：{progress?.experiment.expressionRateChange == null ? "前后各需至少 4 次验证" : progress.experiment.expressionRateChange > 0 ? "上升中" : "尚未上升"}</li>
+            </ul>
+          </div>
+          <p>每千字划词次数已按文章难度校正。曲线向下，且独立评估不下降，才说明阅读正在变轻松。</p>
+          <div className="primary-progress-metric">
+            <span>新语境旧表达独立理解率</span>
+            <strong>{progress?.independentExpressionRate == null ? "证据不足" : `${Math.round(progress.independentExpressionRate * 100)}%`}</strong>
+            <small>仅统计历史划词在新文章再次出现、对应理解题已作答的 {progress?.independentExpressionAttempts ?? 0} 次证据；当天再次划词不计独立理解。</small>
+          </div>
+          {progress?.selectionTrend.length ? <div className="trend-chart" aria-label="归一化划词频率曲线">
+            {progress.selectionTrend.map((point, index) => {
+              const max = Math.max(...progress.selectionTrend.map((item) => item.normalizedRate), 1);
+              return <div className="trend-column" key={`${point.day}-${index}`} title={`${point.day}：${point.normalizedRate.toFixed(1)} 次/千字`}>
+                <span>{point.normalizedRate.toFixed(1)}</span>
+                <i style={{ height: `${Math.max(5, point.normalizedRate / max * 120)}px` }} />
+                <small>{point.day.slice(5)}</small>
+              </div>;
+            })}
+          </div> : <p className="empty-trend">完成阅读并划词后，这里会形成趋势。</p>}
+          <h3 className="trend-subtitle">独立阅读理解</h3>
+          {progress?.assessmentTrend.length ? <div className="assessment-history">{progress.assessmentTrend.map((point) => <div key={point.week}><span>{point.week}</span><strong>{Math.round(point.scoreRate * 100)}%</strong></div>)}</div> : <p className="empty-trend">完成本周独立评估后开始记录。</p>}
+        </div>
+      </section>}
+
+      {showProfile && abilityProfile && <section className="settings-modal">
+        <div className="settings-card profile-card">
+          <button className="close" onClick={() => setShowProfile(false)} aria-label="关闭">×</button>
+          <p className="eyebrow">可查看 · 可校正</p>
+          <h3>基础能力画像</h3>
+          <p>这是学习证据的汇总，不是永久 JLPT 标签。人工设置只控制未来选文目标难度。</p>
+          <div className="profile-grid">
+            <div><span>系统建议</span><strong>{abilityProfile.suggestedLevel}</strong></div>
+            <div><span>完成文章</span><strong>{abilityProfile.completedArticles}</strong></div>
+            <div><span>初始定位</span><strong>{abilityProfile.initialScore == null ? "待测" : `${Math.round(abilityProfile.initialScore * 100)}%`}</strong></div>
+            <div><span>日常理解题</span><strong>{abilityProfile.dailyAccuracy == null ? "证据不足" : `${Math.round(abilityProfile.dailyAccuracy * 100)}%`}</strong></div>
+            <div><span>独立周测</span><strong>{abilityProfile.weeklyAccuracy == null ? "证据不足" : `${Math.round(abilityProfile.weeklyAccuracy * 100)}%`}</strong></div>
+            <div><span>中文展开率</span><strong>{abilityProfile.chineseRevealRate == null ? "证据不足" : `${Math.round(abilityProfile.chineseRevealRate * 100)}%`}</strong></div>
+          </div>
+          <label className="field-label" htmlFor="target-level">未来文章目标难度</label>
+          <select id="target-level" value={targetLevel} onChange={(event) => setTargetLevel(event.target.value)}>
+            <option value="">自动判断</option>
+            {["N5", "N4", "N3", "N2", "N1"].map((level) => <option key={level} value={level}>{level}</option>)}
+          </select>
+          <button className="save-key" onClick={() => void saveTargetLevel()}>保存校正</button>
+          {profileMessage && <p className="key-message">{profileMessage}</p>}
+        </div>
+      </section>}
+
+      {showWeeklyAssessment && weeklyAssessment && <section className="settings-modal">
+        <div className="settings-card weekly-card">
+          <button className="close" onClick={() => setShowWeeklyAssessment(false)} aria-label="关闭">×</button>
+          <p className="eyebrow">每周独立评估 · {weeklyAssessment.week}</p>
+          <h3>不使用翻译，读完这篇新文章</h3>
+          <p className="weekly-rule">评估期间不提供划词解释或中文翻译。结果与日常辅助阅读分开记录。</p>
+          {weeklyResult ? <div className="assessment-result">
+            <strong>{weeklyResult.score} / {weeklyResult.total}</strong>
+            <p>{weeklyResult.levelHint}</p>
+          </div> : weeklyQuestionIndex < 0 ? <>
+            <p className="weekly-title">{weeklyAssessment.article.title}</p>
+            <div className="weekly-reader">{weeklyAssessment.article.paragraphs.map((paragraph, index) => <p key={index}>{paragraph}</p>)}</div>
+            <button className="save-key" onClick={startWeeklyQuestions}>我已读完，开始理解题</button>
+          </> : <>
+            <p className="assessment-prompt">{weeklyAssessment.questions[weeklyQuestionIndex]?.prompt}</p>
+            <div className="assessment-options">{weeklyAssessment.questions[weeklyQuestionIndex]?.choices.map((choice, index) => <button key={`${weeklyQuestionIndex}-${choice}`} onClick={() => void answerWeeklyQuestion(index)}>{choice}</button>)}</div>
+            <small>{weeklyQuestionIndex + 1} / {weeklyAssessment.questions.length}</small>
+          </>}
         </div>
       </section>}
 

@@ -12,6 +12,7 @@ h1 { margin: 0; font-size: 34px; letter-spacing: -.03em; }
 .metric-card { min-width: 238px; padding: 13px 16px; border: 1px solid #d9d5c8; border-radius: 12px; background: #fbfaf5; }
 .metric-card span { display: block; color: #74786e; font-size: 12px; }
 .metric-card strong { display: block; margin-top: 5px; font-size: 14px; }
+.metric-card small { display: block; margin-top: 5px; color: #8a8e85; font-size: 11px; }
 .settings-button { padding: 10px 13px; border: 1px solid #d9d5c8; border-radius: 8px; color: #315e50; background: #fbfaf5; }
 .article-layout { display: grid; grid-template-columns: 180px minmax(620px, 760px); justify-content: center; gap: 42px; }
 .article-meta { display: flex; flex-direction: column; gap: 11px; padding-top: 34px; color: #6e7269; font-size: 13px; }
@@ -25,6 +26,9 @@ h1 { margin: 0; font-size: 34px; letter-spacing: -.03em; }
 .article-block { margin: 0; }
 .article-image-link { display: block; margin: 18px 0 28px; }
 .article-image-link img { display: block; width: 100%; max-height: 460px; border-radius: 4px; object-fit: contain; background: #f1f0e8; }
+.article-embeds { display: grid; gap: 12px; margin: 28px 0; }
+.article-embeds iframe { width: 100%; aspect-ratio: 16 / 9; border: 0; }
+.article-embeds a { padding: 12px 14px; border-left: 3px solid #6a917e; color: #315e50; background: #f1f4ed; text-decoration: none; }
 .finish-zone { margin-top: 48px; padding-top: 32px; border-top: 1px solid #e5e0d2; text-align: center; }
 .finish-zone p { color: #72766c; font-size: 14px; }
 .finish-zone button, .evidence button { padding: 12px 19px; border: 0; border-radius: 7px; color: #fff; background: #315e50; }
@@ -37,6 +41,10 @@ h1 { margin: 0; font-size: 34px; letter-spacing: -.03em; }
 .chinese { margin: 10px 0; padding: 9px; border-radius: 6px; background: #eef2eb; color: #394238; line-height: 1.6; }
 .text-button { padding: 0; border: 0; color: #315e50; background: transparent; text-decoration: underline; }
 .selection-popover small { display: block; margin-top: 12px; color: #8a8e85; font-size: 11px; }
+.deep-button { margin-top: 12px; padding: 6px 0; border: 0; color: #315e50; background: transparent; font-size: 12px; text-decoration: underline; }
+.deep-explanation { max-height: 260px; margin-top: 10px; padding-top: 10px; border-top: 1px solid #dce2d8; overflow: auto; }
+.deep-explanation p { margin: 6px 0; font-size: 13px; line-height: 1.65; }
+.inline-error { color: #9a3d32 !important; }
 .thinking { color: #6f756b; }
 .overlay-panel, .feedback-panel { position: fixed; z-index: 15; right: 48px; bottom: 40px; width: 400px; padding: 26px; border: 1px solid #d9d5c8; border-radius: 14px; background: #fffefa; box-shadow: 0 22px 55px rgba(34, 38, 30, .18); }
 .quiz-panel h3, .feedback-panel h3 { margin: 0 0 18px; font-size: 21px; line-height: 1.45; }
@@ -57,11 +65,44 @@ blockquote { margin: 10px 0; padding: 10px 13px; border-left: 3px solid #6a917e;
 .settings-card { position: relative; width: 460px; padding: 30px; border: 1px solid #d9d5c8; border-radius: 14px; background: #fffefa; box-shadow: 0 24px 70px rgba(20, 30, 20, .25); }
 .settings-card h3 { margin: 0 0 8px; font-size: 25px; }
 .settings-card p { color: #5f655c; line-height: 1.6; }
-.settings-card input { width: 100%; margin: 10px 0; padding: 12px; border: 1px solid #d5d4ca; border-radius: 7px; background: #fff; }
+.field-label { display: block; margin: 15px 0 -3px; color: #5f655c; font-size: 12px; font-weight: 700; letter-spacing: .04em; }
+.settings-card input, .settings-card select { width: 100%; margin: 10px 0; padding: 12px; border: 1px solid #d5d4ca; border-radius: 7px; background: #fff; }
+.settings-card select:disabled { color: #8a8e85; background: #f1f0ea; }
+.detect-models { width: 100%; margin: 2px 0 5px; padding: 10px; border: 1px solid #315e50; border-radius: 7px; color: #315e50; background: #f7fbf5; }
+.detect-models:disabled { opacity: .55; cursor: default; }
 .save-key { width: 100%; padding: 11px; border: 0; border-radius: 7px; color: #fff; background: #315e50; }
 .save-key:disabled { opacity: .5; cursor: default; }
 .settings-card small { display: block; margin-top: 14px; color: #737970; line-height: 1.5; }
 .key-message { color: #315e50 !important; font-weight: 700; }
+.settings-divider { margin: 24px 0; border-top: 1px solid #e2ded2; }
+.reminder-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.reminder-actions .save-key:only-child { grid-column: 1 / -1; }
+.secondary-action { padding: 11px; border: 1px solid #b8b9b0; border-radius: 7px; color: #62675f; background: #fff; }
+.progress-card { width: min(720px, calc(100vw - 70px)); }
+.experiment-status { margin: 18px 0; padding: 15px 17px; border-left: 3px solid #9a8b5e; background: #f5f2e8; }
+.experiment-status.ready { border-color: #4f7868; background: #eef4ed; }
+.experiment-status div { display: flex; justify-content: space-between; gap: 20px; }
+.experiment-status span, .experiment-status small { color: #74786e; font-size: 12px; }
+.experiment-status strong { color: #315e50; font-size: 14px; }
+.experiment-status ul { margin: 12px 0 0; padding-left: 18px; color: #5f655c; font-size: 12px; line-height: 1.8; }
+.primary-progress-metric { display: grid; grid-template-columns: 1fr auto; gap: 4px 20px; margin: 20px 0; padding: 16px; border-left: 3px solid #4f7868; background: #f0f4ed; }
+.primary-progress-metric span { color: #5f655c; font-size: 13px; }
+.primary-progress-metric strong { grid-row: span 2; align-self: center; color: #315e50; font-size: 28px; }
+.primary-progress-metric small { color: #737970; line-height: 1.5; }
+.trend-chart { display: flex; align-items: end; gap: 10px; height: 185px; margin: 25px 0 30px; padding: 18px 16px 0; border-bottom: 1px solid #d8d5c8; overflow-x: auto; }
+.trend-column { display: grid; flex: 1 0 38px; justify-items: center; align-items: end; height: 100%; color: #74786e; font-size: 11px; }
+.trend-column span { margin-bottom: 5px; }
+.trend-column i { display: block; width: 22px; min-height: 5px; border-radius: 3px 3px 0 0; background: #4f7868; }
+.trend-column small { margin: 6px 0 !important; white-space: nowrap; }
+.trend-subtitle { margin-top: 28px !important; font-size: 19px !important; }
+.assessment-history { display: grid; gap: 7px; }
+.assessment-history div { display: flex; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid #e5e1d6; }
+.profile-card { width: min(620px, calc(100vw - 70px)); }
+.profile-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; margin: 22px 0; background: #dedbd0; border: 1px solid #dedbd0; }
+.profile-grid div { min-height: 82px; padding: 13px; background: #fffefa; }
+.profile-grid span { display: block; color: #74786e; font-size: 12px; }
+.profile-grid strong { display: block; margin-top: 9px; color: #315e50; font-size: 20px; }
+.empty-trend { padding: 20px; color: #7b8077 !important; background: #f5f4ee; text-align: center; }
 .calibration-card { width: 520px; }
 .candidate-title { margin: 20px 0 !important; color: #202a23 !important; font-family: "Hiragino Mincho ProN", Georgia, serif; font-size: 21px; font-weight: 700; line-height: 1.55 !important; }
 .calibration-actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 9px; margin-top: 22px; }
@@ -72,4 +113,11 @@ blockquote { margin: 10px 0; padding: 10px 13px; border-left: 3px solid #6a917e;
 .assessment-options { display: grid; gap: 8px; margin: 20px 0; }
 .assessment-options button { padding: 11px 13px; border: 1px solid #d8d5c8; border-radius: 7px; background: #fffefa; text-align: left; }
 .assessment-options button:hover { border-color: #315e50; background: #f0f5ee; }
+.weekly-card { width: min(760px, calc(100vw - 70px)); max-height: calc(100vh - 70px); overflow: auto; }
+.weekly-rule { padding: 10px 12px; border-left: 3px solid #6a917e; background: #f2f5ed; font-size: 13px; }
+.weekly-title { color: #202a23 !important; font-family: "Hiragino Mincho ProN", Georgia, serif; font-size: 24px; font-weight: 700; }
+.weekly-reader { max-height: 48vh; overflow: auto; padding: 6px 20px; border: 1px solid #e3dfd3; background: #fff; }
+.weekly-reader p { color: #20221f; font-family: "Hiragino Mincho ProN", "Yu Mincho", serif; font-size: 17px; line-height: 2; }
+.assessment-result { padding: 16px; border-radius: 8px; background: #edf4ec; }
+.assessment-result strong { color: #315e50; font-size: 30px; }
 @media (max-width: 1100px) { .app-shell { padding-left: 30px; padding-right: 30px; } .article-layout { grid-template-columns: 130px minmax(580px, 720px); gap: 24px; } .reader { padding: 50px; } }

@@ -22,5 +22,10 @@
     ],
     "security": { "csp": null }
   },
-  "bundle": { "active": true, "targets": "all", "icon": ["icons/icon.png"] }
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.png"],
+    "macOS": { "signingIdentity": "-" }
+  }
 }
