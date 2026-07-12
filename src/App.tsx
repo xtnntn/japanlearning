@@ -60,11 +60,13 @@ export default function App() {
   const selectionPopoverRef = useRef<HTMLElement>(null);
   const finishRef = useRef<HTMLDivElement>(null);
   const generatingQuestionsRef = useRef(false);
+  const selectionRequestTimerRef = useRef<number | undefined>(undefined);
+  const selectionRequestSequenceRef = useRef(0);
 
   const currentQuestion = questions[questionIndex];
   const selectionRateHint = useMemo(() => {
     if (!progress || !article) return "正在建立基线";
-    return `${progress.selectedCount} 次划词 · 中文展开 ${progress.chineseReveals} 次`;
+    return `标记 ${progress.selectedCount} 处 · 中文辅助 ${progress.chineseReveals} 次`;
   }, [progress, article]);
 
   useEffect(() => {
@@ -97,15 +99,29 @@ export default function App() {
 
   useEffect(() => {
     if (!selection) return;
+    const dismissSelection = () => {
+      selectionRequestSequenceRef.current += 1;
+      window.clearTimeout(selectionRequestTimerRef.current);
+      setSelection(undefined);
+      setExplanation(undefined);
+      setExplanationError(undefined);
+    };
     const closeWhenClickingOutside = (event: PointerEvent) => {
       const target = event.target as Node;
       if (!selectionPopoverRef.current?.contains(target)) {
-        setSelection(undefined);
+        dismissSelection();
       }
     };
     window.addEventListener("pointerdown", closeWhenClickingOutside);
-    return () => window.removeEventListener("pointerdown", closeWhenClickingOutside);
+    // Capturing scroll also catches nested scrolling containers in modals/readers.
+    window.addEventListener("scroll", dismissSelection, true);
+    return () => {
+      window.removeEventListener("pointerdown", closeWhenClickingOutside);
+      window.removeEventListener("scroll", dismissSelection, true);
+    };
   }, [selection]);
+
+  useEffect(() => () => window.clearTimeout(selectionRequestTimerRef.current), []);
 
   const handleSelection = () => {
     const nativeSelection = window.getSelection();
@@ -115,12 +131,26 @@ export default function App() {
     if (text.length > 160) return;
     const rect = range.getBoundingClientRect();
     const context = range.commonAncestorContainer.parentElement?.closest("p")?.textContent ?? text;
+    const requestSequence = ++selectionRequestSequenceRef.current;
+    window.clearTimeout(selectionRequestTimerRef.current);
     setSelection({ text, context, x: rect.left + rect.width / 2, y: rect.bottom + 12 });
     setExplanation(undefined);
     setExplanationError(undefined);
-    void api.explainSelection(article.id, text, context)
-      .then((result) => { setExplanation(result); void api.getProgress().then(setProgress); })
-      .catch((reason) => setExplanationError(String(reason)));
+    // A short debounce merges rapid re-selections while the user is adjusting a boundary.
+    // Only the newest selection is allowed to update the popover.
+    selectionRequestTimerRef.current = window.setTimeout(() => {
+      void api.explainSelection(article.id, text, context)
+        .then((result) => {
+          if (requestSequence !== selectionRequestSequenceRef.current) return;
+          setExplanation(result);
+          void api.getProgress().then(setProgress);
+        })
+        .catch((reason) => {
+          if (requestSequence !== selectionRequestSequenceRef.current) return;
+          const message = String(reason);
+          setExplanationError(message.includes("JSON 无效") ? "AI 返回格式异常，已自动重试仍未成功。请稍后重新划选。" : message);
+        });
+    }, 180);
   };
 
   const refreshDaily = async () => {
@@ -323,29 +353,31 @@ export default function App() {
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div>
-          <p className="eyebrow">日语阅读日报 · TODAY</p>
+        <div className="brand-block">
+          <p className="eyebrow">Kotoba Atelier · TODAY</p>
           <h1>今天只读这一篇</h1>
         </div>
-        <div className="metric-card">
-          <span>旧表达独立理解率</span>
-          <strong>{progress?.independentExpressionRate == null ? "正在建立证据" : `${Math.round(progress.independentExpressionRate * 100)}%`}</strong>
-          <small>{progress?.independentExpressionAttempts ?? 0} 次新语境验证</small>
+        <div className="metric-card hero-summary">
+          <span>学习信号</span>
+          <strong>{progress?.independentExpressionRate == null ? "积累中" : `${Math.round(progress.independentExpressionRate * 100)}%`}</strong>
+          <small>{progress?.independentExpressionRate == null ? "等待第一次新语境重逢" : "新语境中的旧表达理解"}</small>
           <small>{selectionRateHint}</small>
-          <small>{progress?.completedArticles ?? 0} 篇完成 · {progress?.missedArticles ?? 0} 篇过期</small>
+          <small>完成 {progress?.completedArticles ?? 0} 篇 · 略过 {progress?.missedArticles ?? 0} 篇</small>
         </div>
-        <button className="settings-button" onClick={() => {
-          setBaseUrl(aiStatus?.baseUrl ?? "https://api.openai.com/v1");
-          setModel(aiStatus?.model ?? "gpt-5.6-luna");
-          setProtocol(aiStatus?.protocol ?? "responses");
-          setShowSettings(true);
-        }}>AI 设置</button>
-        <button className="settings-button" onClick={() => void openWeeklyAssessment()}>本周独立评估</button>
-        <button className="settings-button" onClick={() => setShowProgress(true)}>进步曲线</button>
-        <button className="settings-button" onClick={() => void openProfile()}>能力画像</button>
-        <button className="settings-button" onClick={() => void refreshDaily()} disabled={completed || refreshingDaily} title={completed ? "完成后日报不可更换" : "换一篇未读日报"}>
-          {refreshingDaily ? "正在刷新…" : "刷新日报"}
-        </button>
+        <nav className="toolbar" aria-label="学习工具">
+          <button className="settings-button" onClick={() => {
+            setBaseUrl(aiStatus?.baseUrl ?? "https://api.openai.com/v1");
+            setModel(aiStatus?.model ?? "gpt-5.6-luna");
+            setProtocol(aiStatus?.protocol ?? "responses");
+            setShowSettings(true);
+          }}>AI 工作台</button>
+          <button className="settings-button" onClick={() => void openWeeklyAssessment()}>独立阅读</button>
+          <button className="settings-button" onClick={() => setShowProgress(true)}>学习轨迹</button>
+          <button className="settings-button" onClick={() => void openProfile()}>语言画像</button>
+          <button className="settings-button refresh-button" onClick={() => void refreshDaily()} disabled={completed || refreshingDaily} title={completed ? "完成后日报不可更换" : "换一篇未读日报"}>
+            {refreshingDaily ? "正在选文…" : "重新选文"}
+          </button>
+        </nav>
       </header>
 
       {dailyRefreshMessage && <p className="daily-refresh-message">{dailyRefreshMessage}</p>}
@@ -374,10 +406,34 @@ export default function App() {
           </section>}
           <div className="finish-zone" ref={finishRef}>
             <p>{completed ? "已到达文末，理解题已出现。" : quizError ? `理解题准备失败：${quizError}` : "到达这里会自动准备理解题。"}</p>
-            <button onClick={() => void finishReading()} disabled={completed}>
-              {completed ? "已进入理解题" : "没有自动出现？点击重试"}
-            </button>
+            {!completed && <button onClick={() => void finishReading()}>没有自动出现？点击重试</button>}
           </div>
+          {completed && (
+            <section className="inline-quiz" aria-live="polite">
+              {currentQuestion ? <>
+                <p className="eyebrow">理解题 {questionIndex + 1} / {questions.length}</p>
+                <h3>{currentQuestion.prompt}</h3>
+                <div className="choices">
+                  {currentQuestion.choices.map((choice, index) => {
+                    const isChosen = answerState?.chosen === index;
+                    const isAnswer = index === currentQuestion.answerIndex;
+                    return <button key={choice} disabled={Boolean(answerState)} onClick={() => void answerQuestion(index)} className={answerState ? (isAnswer ? "correct" : isChosen ? "wrong" : "") : ""}>{choice}</button>;
+                  })}
+                </div>
+                {answerState && <div className="evidence">
+                  <strong>{answerState.correct ? "答对了" : "正确答案与原文依据"}</strong>
+                  <span className="evidence-label">原文依据</span>
+                  <blockquote>{currentQuestion.evidence}</blockquote>
+                  <span className="evidence-label">中文解析</span>
+                  <p>{currentQuestion.explanation}</p>
+                  {questionIndex + 1 < questions.length ? <button onClick={nextQuestion}>下一题</button> : <div className="inline-feedback">
+                    <p className="done">理解题完成。你对今天这个题材的感觉？</p>
+                    {feedback ? <p className="feedback-confirmed">已记录：{feedback}</p> : <div className="feedback-options">{feedbackOptions.map((option) => <button key={option} onClick={() => void submitFeedback(option)}>{option}</button>)}</div>}
+                  </div>}
+                </div>}
+              </> : <p>正在准备理解题…</p>}
+            </section>
+          )}
         </article>
       </section>
 
@@ -387,9 +443,9 @@ export default function App() {
           {explanation ? <>
             <p className="reading"><strong>读音</strong> {explanation.reading}</p>
             <p className="translation"><strong>译文</strong> {explanation.translation}</p>
-            <p><strong>语境</strong> {explanation.contextNote}</p>
-            <div className="example"><strong>例句</strong><p>{explanation.example}</p><p>{explanation.exampleTranslation}</p></div>
-            <p className="grammar"><strong>语法/搭配</strong> {explanation.grammarNote}</p>
+            {explanation.contextNote && <p><strong>语境</strong> {explanation.contextNote}</p>}
+            {explanation.example && <div className="example"><strong>例句</strong><p>{explanation.example}</p>{explanation.exampleTranslation && <p>{explanation.exampleTranslation}</p>}</div>}
+            {explanation.grammarNote && <p className="grammar"><strong>语法/搭配</strong> {explanation.grammarNote}</p>}
           </> : explanationError ? <p className="inline-error">生成失败：{explanationError}<br />请关闭后重新划选一次。</p> : <p className="thinking">正在结合上下文生成解释…</p>}
         </section>
       )}
@@ -397,28 +453,32 @@ export default function App() {
       {showSettings && <section className="settings-modal">
         <div className="settings-card ai-settings-card">
           <button className="close" onClick={() => setShowSettings(false)} aria-label="关闭">×</button>
-          <p className="eyebrow">OpenAI 兼容 API</p>
-          <h3>AI 解释设置</h3>
-          <p>当前状态：{aiStatus?.configured ? `已配置（${aiStatus.model} · ${aiStatus.protocol === "chat_completions" ? "Chat Completions" : "Responses"}）` : "未配置，本地降级解释中"}</p>
-          <div className="ai-config-grid">
-            <div className="wide-field"><label className="field-label" htmlFor="base-url">Base URL</label><input id="base-url" type="url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setAvailableModels([]); }} placeholder="https://api.openai.com/v1" autoComplete="url" /></div>
-            <div><label className="field-label" htmlFor="protocol">调用协议</label><select id="protocol" value={protocol} onChange={(event) => setProtocol(event.target.value as "responses" | "chat_completions")}><option value="responses">Responses</option><option value="chat_completions">Chat Completions</option></select></div>
-            <div><label className="field-label" htmlFor="model">模型</label><select id="model" value={model} onChange={(event) => setModel(event.target.value)} disabled={availableModels.length === 0}>{availableModels.length === 0 ? <option>请先检测可用模型</option> : availableModels.map((name) => <option key={name} value={name}>{name}</option>)}</select></div>
-            <div className="wide-field"><label className="field-label" htmlFor="api-key">API Key</label><input id="api-key" type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setAvailableModels([]); }} placeholder={aiStatus?.configured ? "已安全保存；仅在替换 Key 时输入" : "粘贴 API Key"} autoComplete="off" /></div>
-          </div>
-          <button className="detect-models" onClick={() => void detectModels()} disabled={!baseUrl.trim() || (!apiKey.trim() && !aiStatus?.configured) || detectingModels}>{detectingModels ? "正在检测模型…" : "检测可用模型"}</button>
-          <button className="save-key" onClick={() => void saveKey()} disabled={!baseUrl.trim() || availableModels.length === 0 || (!apiKey.trim() && !aiStatus?.configured)}>保存 AI 设置</button>
-          <small>只有 API Key 会访问 macOS Keychain；Base URL、协议和模型保存在本地应用设置，不会触发钥匙串授权。Responses 调用 <code>/responses</code>；Chat Completions 调用 <code>/chat/completions</code>。你的 tokendance 网关应选择后者。</small>
+          <header className="settings-hero">
+            <p className="eyebrow">语言引擎</p>
+            <h3>AI 工作台</h3>
+            <p className={`settings-status ${aiStatus?.configured ? "configured" : ""}`}><i />{aiStatus?.configured ? `已连接 · ${aiStatus.model} · ${aiStatus.protocol === "chat_completions" ? "Chat Completions" : "Responses"}` : "尚未连接 · 将使用本地提示"}</p>
+          </header>
+          <section className="settings-section">
+            <div className="section-heading"><strong>连接配置</strong><small>选择与你的 API 网关匹配的调用方式。</small></div>
+            <div className="ai-config-grid">
+              <div className="wide-field"><label className="field-label" htmlFor="base-url">服务地址 <em>Base URL</em></label><input id="base-url" type="url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setAvailableModels([]); }} placeholder="https://api.openai.com/v1" autoComplete="url" /></div>
+              <div><label className="field-label" htmlFor="protocol">调用方式</label><select id="protocol" value={protocol} onChange={(event) => setProtocol(event.target.value as "responses" | "chat_completions")}><option value="responses">Responses</option><option value="chat_completions">Chat Completions</option></select></div>
+              <div><label className="field-label" htmlFor="model">使用模型</label><select id="model" value={model} onChange={(event) => setModel(event.target.value)} disabled={availableModels.length === 0}>{availableModels.length === 0 ? <option>先刷新模型列表</option> : availableModels.map((name) => <option key={name} value={name}>{name}</option>)}</select></div>
+              <div className="wide-field"><label className="field-label" htmlFor="api-key">访问密钥 <em>API Key</em></label><input id="api-key" type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setAvailableModels([]); }} placeholder={aiStatus?.configured ? "密钥已安全保存；仅在替换时输入" : "粘贴 API Key"} autoComplete="off" /></div>
+            </div>
+            <div className="settings-actions"><button className="detect-models" onClick={() => void detectModels()} disabled={!baseUrl.trim() || (!apiKey.trim() && !aiStatus?.configured) || detectingModels}>{detectingModels ? "正在刷新…" : "刷新模型列表"}</button><button className="save-key" onClick={() => void saveKey()} disabled={!baseUrl.trim() || availableModels.length === 0 || (!apiKey.trim() && !aiStatus?.configured)}>保存连接</button></div>
+            <p className="settings-note">只有访问密钥会使用 macOS Keychain；其他配置只保存在本机。tokendance 网关请使用 Chat Completions。</p>
+          </section>
           {keyMessage && <p className="key-message">{keyMessage}</p>}
-          <div className="settings-divider" />
-          <p className="eyebrow">每日阅读提醒</p>
-          <p>当前状态：{reminder.enabled ? `已启用（${String(reminder.hour).padStart(2, "0")}:${String(reminder.minute).padStart(2, "0")}）` : "未启用"}</p>
-          <label className="field-label" htmlFor="reminder-time">提醒时间</label>
-          <input id="reminder-time" type="time" value={reminderTime} onChange={(event) => setReminderTime(event.target.value)} />
-          <div className="reminder-actions">
-            {reminder.enabled && <button className="secondary-action" onClick={() => void disableReminder()}>关闭提醒</button>}
-            <button className="save-key" onClick={() => void saveReminder()}>{reminder.enabled ? "更新时间" : "启用提醒"}</button>
-          </div>
+          <section className="settings-section reminder-section">
+            <div className="section-heading"><strong>每日阅读提醒</strong><small>{reminder.enabled ? `已安排在 ${String(reminder.hour).padStart(2, "0")}:${String(reminder.minute).padStart(2, "0")}` : "为明天的唯一阅读留一个固定入口。"}</small></div>
+            <label className="field-label" htmlFor="reminder-time">提醒时间</label>
+            <input id="reminder-time" type="time" value={reminderTime} onChange={(event) => setReminderTime(event.target.value)} />
+            <div className="reminder-actions">
+              {reminder.enabled && <button className="secondary-action" onClick={() => void disableReminder()}>暂停提醒</button>}
+              <button className="save-key" onClick={() => void saveReminder()}>{reminder.enabled ? "更新提醒" : "启用提醒"}</button>
+            </div>
+          </section>
           {reminderMessage && <p className="key-message">{reminderMessage}</p>}
         </div>
       </section>}
@@ -534,35 +594,6 @@ export default function App() {
         </div>
       </section>}
 
-      {completed && currentQuestion && (
-        <section className="overlay-panel quiz-panel">
-          <p className="eyebrow">理解题 {questionIndex + 1} / {questions.length}</p>
-          <h3>{currentQuestion.prompt}</h3>
-          <div className="choices">
-            {currentQuestion.choices.map((choice, index) => {
-              const isChosen = answerState?.chosen === index;
-              const isAnswer = index === currentQuestion.answerIndex;
-              return <button key={choice} disabled={Boolean(answerState)} onClick={() => void answerQuestion(index)} className={answerState ? (isAnswer ? "correct" : isChosen ? "wrong" : "") : ""}>{choice}</button>;
-            })}
-          </div>
-          {answerState && <div className="evidence">
-            <strong>{answerState.correct ? "答对了" : "再看一次原文证据"}</strong>
-            <blockquote>{currentQuestion.evidence}</blockquote>
-            <p>{currentQuestion.explanation}</p>
-            {questionIndex + 1 < questions.length ? <button onClick={nextQuestion}>下一题</button> : <p className="done">理解题完成。请选择对今天题材的感觉。</p>}
-          </div>}
-        </section>
-      )}
-
-      {completed && !currentQuestion && <section className="overlay-panel quiz-panel"><p>正在准备理解题…</p></section>}
-
-      {completed && questions.length > 0 && questionIndex === questions.length - 1 && answerState && (
-        <section className="feedback-panel">
-          <p className="eyebrow">题材反馈</p>
-          <h3>你对今天这个题材的感觉？</h3>
-          {feedback ? <p className="feedback-confirmed">已记录：{feedback}</p> : <div className="feedback-options">{feedbackOptions.map((option) => <button key={option} onClick={() => void submitFeedback(option)}>{option}</button>)}</div>}
-        </section>
-      )}
     </main>
   );
 }

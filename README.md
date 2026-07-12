@@ -1,4 +1,4 @@
-# 日语阅读日报
+# Kotoba Atelier
 
 面向中文母语者的个人 AI 日语阅读训练器。它每天只提供一篇与你兴趣和能力相匹配的真实日文文章，帮助你逐步摆脱中文翻译，独立读懂 ACGN、VTuber 等题材的内容。
 
@@ -36,7 +36,7 @@
 - 衡量进步不能只看划词减少；需要同时观察无翻译理解和新语境中旧表达的独立理解率。
 
 完整决策见 [docs/产品决策记录.md](docs/产品决策记录.md)。
-当前实现证据与剩余验证见 [docs/MVP实现审计.md](docs/MVP实现审计.md)。
+当前实现证据与剩余验证见 [docs/MVP实现审计.md](docs/MVP实现审计.md)；实施状态与后续任务见 [docs/项目进度表.md](docs/项目进度表.md)。
 
 ## 开发环境
 
@@ -77,8 +77,8 @@ npm run tauri build
 构建结果位于：
 
 ```text
-src-tauri/target/release/bundle/macos/日语阅读日报.app
-src-tauri/target/release/bundle/dmg/日语阅读日报_0.1.0_aarch64.dmg
+src-tauri/target/release/bundle/macos/Kotoba Atelier.app
+src-tauri/target/release/bundle/dmg/Kotoba Atelier_0.1.0_aarch64.dmg
 ```
 
 当前两周试验包 SHA-256：

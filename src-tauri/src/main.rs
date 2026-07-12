@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-  nihongo_daily_reader_lib::run()
+  kotoba_atelier_lib::run()
 }

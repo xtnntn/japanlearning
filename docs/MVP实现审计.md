@@ -3,7 +3,7 @@
 > 审计依据：`docs/产品决策记录.md`  
 > 更新日期：2026-07-11
 
-当前试验包：`日语阅读日报_0.1.0_aarch64.dmg`，SHA-256 `9994ac5f48686e21fe2acdf32e7b49df2c59e912762ff7e2e37b2662c157c87fbf`。该包已包含能力画像、主动深入解释和严格两周实验状态。
+当前试验包：`Kotoba Atelier_0.1.0_aarch64.dmg`。每次重新打包后应重新计算 SHA-256；该包已包含能力画像、主动深入解释和严格两周实验状态。
 
 ## 已实现并有代码证据
 
@@ -19,6 +19,7 @@
 - Base URL、API Key、模型发现、Responses / Chat Completions 协议选择和 macOS Keychain 持久化；
 - AI 设置弹窗使用独立滚动容器，避免滚轮穿透到阅读器；当 Rust keyring 无法读取旧 macOS Keychain 条目时，应用会安全回退到系统 `security` 查询同一条目，不输出或保存密钥明文。
 - 用户主动安装、修改或移除的 `launchd` 每日标题提醒。
+- 每日提醒与主窗口选文都按最新文章 ID 扩展至 80 个候选、排除历史 URL 并进行三次重试；抓取失败会明确提示，绝不再把本地示例文写入日报或每周独立评估。2026-07-12 已手动执行 release `--daily-reminder` 并实际保存 KAI-YOU `/article/95928`；LaunchAgent 强制运行后退出码为 0。
 - release `.app` 与 `.dmg` 构建成功；App 完整 ad-hoc 签名通过 `codesign --verify --deep --strict`，DMG 通过 `hdiutil verify`；
 - release App 实际启动后进程路径来自包内可执行文件，`--daily-reminder` 分支可独立运行并正常退出。
 - macOS Keychain `apple-native` 后端通过临时凭证写入、读取、删除往返测试，测试不接触真实 API Key。

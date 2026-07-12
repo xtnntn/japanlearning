@@ -3,7 +3,7 @@ use reqwest::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, path::PathBuf, process::Command, sync::{Mutex, OnceLock}, time::Duration};
+use std::{cmp::Reverse, collections::HashSet, fs, path::PathBuf, process::Command, sync::{Mutex, OnceLock}, time::Duration};
 use tauri::{Manager, State};
 use tauri_plugin_notification::NotificationExt;
 use thiserror::Error;
@@ -34,12 +34,15 @@ struct AppState {
 
 static API_KEY_CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static LOCAL_AI_SETTINGS: OnceLock<Mutex<LocalAiSettings>> = OnceLock::new();
+static API_HTTP_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
+static CHAT_JSON_SCHEMA_CAPABILITY: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct LocalAiSettings {
   base_url: Option<String>,
   model: Option<String>,
   protocol: Option<String>,
+  api_key_saved: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,20 +315,7 @@ fn reminder_plist_path() -> Result<PathBuf, AppError> {
   Ok(PathBuf::from(home).join("Library/LaunchAgents/com.xtnntn.nihongo-daily-reader.reminder.plist"))
 }
 
-#[tauri::command]
-fn get_reminder_status(state: State<'_, AppState>) -> Result<ReminderStatus, AppError> {
-  let conn = open_db(&state)?;
-  let value = conn.query_row("SELECT value FROM app_settings WHERE key = 'daily_reminder'", [], |row| row.get::<_, String>(0)).optional()?;
-  let (enabled, hour, minute) = value.and_then(|value| {
-    let mut parts = value.split(':');
-    Some((true, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
-  }).unwrap_or((false, 9, 0));
-  Ok(ReminderStatus { enabled, hour, minute })
-}
-
-#[tauri::command]
-fn install_daily_reminder(state: State<'_, AppState>, hour: u8, minute: u8) -> Result<ReminderStatus, AppError> {
-  if hour > 23 || minute > 59 { return Err(AppError::Message("提醒时间无效".into())); }
+fn write_daily_reminder_plist(hour: u8, minute: u8) -> Result<(), AppError> {
   let executable = std::env::current_exe().map_err(|error| AppError::Message(format!("无法定位应用程序：{error}")))?;
   let plist_path = reminder_plist_path()?;
   if let Some(parent) = plist_path.parent() { fs::create_dir_all(parent).map_err(|error| AppError::Message(format!("无法创建提醒目录：{error}")))?; }
@@ -343,6 +333,27 @@ fn install_daily_reminder(state: State<'_, AppState>, hour: u8, minute: u8) -> R
   let status = Command::new("launchctl").args(["load", &plist_path.to_string_lossy()]).status()
     .map_err(|error| AppError::Message(format!("无法启用提醒：{error}")))?;
   if !status.success() { return Err(AppError::Message("launchd 未能启用每日提醒".into())); }
+  Ok(())
+}
+
+#[tauri::command]
+fn get_reminder_status(state: State<'_, AppState>) -> Result<ReminderStatus, AppError> {
+  let conn = open_db(&state)?;
+  let value = conn.query_row("SELECT value FROM app_settings WHERE key = 'daily_reminder'", [], |row| row.get::<_, String>(0)).optional()?;
+  let (enabled, hour, minute) = value.and_then(|value| {
+    let mut parts = value.split(':');
+    Some((true, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+  }).unwrap_or((false, 9, 0));
+  // Product renames change the .app executable path. Refresh an already authorized
+  // reminder when the main window opens so the next schedule uses the new bundle.
+  if enabled { write_daily_reminder_plist(hour, minute)?; }
+  Ok(ReminderStatus { enabled, hour, minute })
+}
+
+#[tauri::command]
+fn install_daily_reminder(state: State<'_, AppState>, hour: u8, minute: u8) -> Result<ReminderStatus, AppError> {
+  if hour > 23 || minute > 59 { return Err(AppError::Message("提醒时间无效".into())); }
+  write_daily_reminder_plist(hour, minute)?;
   let conn = open_db(&state)?;
   conn.execute("INSERT INTO app_settings (key, value) VALUES ('daily_reminder', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![format!("{hour:02}:{minute:02}")])?;
   Ok(ReminderStatus { enabled: true, hour, minute })
@@ -438,6 +449,13 @@ fn get_protocol() -> String {
     .unwrap_or_else(|| "responses".into())
 }
 
+fn ai_is_configured_without_keychain_access() -> bool {
+  let settings = local_ai_settings();
+  settings.api_key_saved.unwrap_or_else(|| {
+    settings.base_url.is_some() && settings.model.is_some() && settings.protocol.is_some()
+  })
+}
+
 fn responses_url(base_url: &str) -> Result<String, AppError> {
   let mut base = base_url.trim().trim_end_matches('/').to_string();
   let parsed = url::Url::parse(&base)
@@ -465,6 +483,26 @@ fn models_url(base_url: &str) -> Result<String, AppError> {
   Ok(responses_endpoint.trim_end_matches("/responses").to_string() + "/models")
 }
 
+fn api_http_client() -> Result<&'static Client, AppError> {
+  API_HTTP_CLIENT.get_or_init(|| Client::builder()
+    .timeout(Duration::from_secs(30))
+    .pool_idle_timeout(Duration::from_secs(90))
+    .build()
+    .map_err(|error| error.to_string()))
+    .as_ref()
+    .map_err(|error| AppError::Message(format!("无法初始化 AI 网络连接：{error}")))
+}
+
+fn cached_json_schema_capability() -> Option<bool> {
+  CHAT_JSON_SCHEMA_CAPABILITY.get_or_init(|| Mutex::new(None)).lock().ok().and_then(|value| *value)
+}
+
+fn remember_json_schema_capability(value: bool) {
+  if let Ok(mut capability) = CHAT_JSON_SCHEMA_CAPABILITY.get_or_init(|| Mutex::new(None)).lock() {
+    *capability = Some(value);
+  }
+}
+
 async fn generate_structured<T: for<'de> Deserialize<'de>>(
   api_key: &str,
   system: &str,
@@ -472,28 +510,34 @@ async fn generate_structured<T: for<'de> Deserialize<'de>>(
   schema_name: &str,
   schema: serde_json::Value,
 ) -> Result<T, AppError> {
-  let client = Client::builder().timeout(Duration::from_secs(45)).build()?;
+  let client = api_http_client()?;
   let protocol = get_protocol();
+  let mut last_empty_response = false;
+  for attempt in 0..2 {
   let output = if protocol == "chat_completions" {
     let endpoint = chat_completions_url(&get_base_url())?;
     let chat_system = format!("{system}\n\n必须只返回一个符合要求的 JSON 对象，不要 Markdown 或额外说明。");
     let mut payload = serde_json::json!({
       "model": get_model(),
+      "max_tokens": 480,
       "messages": [
         { "role": "system", "content": chat_system },
         { "role": "user", "content": user }
       ],
-      "response_format": {
-        "type": "json_schema",
-        "json_schema": {
-          "name": schema_name,
-          "strict": true,
-          "schema": schema.clone()
-        }
-      }
     });
+    // A successful HTTP response can still contain an empty `content` on some
+    // OpenAI-compatible routers. The second attempt deliberately avoids strict
+    // schema mode instead of repeating the exact same request.
+    let use_json_schema = attempt == 0 && cached_json_schema_capability().unwrap_or(true);
+    payload["response_format"] = if use_json_schema {
+      serde_json::json!({ "type": "json_schema", "json_schema": { "name": schema_name, "strict": true, "schema": schema.clone() } })
+    } else {
+      serde_json::json!({ "type": "json_object" })
+    };
     let mut response = client.post(&endpoint).bearer_auth(api_key).json(&payload).send().await?;
-    if !response.status().is_success() && matches!(response.status().as_u16(), 400 | 422) {
+    if use_json_schema && response.status().is_success() { remember_json_schema_capability(true); }
+    if use_json_schema && !response.status().is_success() && matches!(response.status().as_u16(), 400 | 422) {
+      remember_json_schema_capability(false);
       payload["response_format"] = serde_json::json!({ "type": "json_object" });
       response = client.post(&endpoint).bearer_auth(api_key).json(&payload).send().await?;
     }
@@ -548,7 +592,24 @@ async fn generate_structured<T: for<'de> Deserialize<'de>>(
     .ok_or_else(|| AppError::Message("Responses 未返回 output_text".into()))?
   };
   let output = output.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
-  serde_json::from_str(output).map_err(|error| AppError::Message(format!("AI 返回 JSON 无效：{error}")))
+  if output.is_empty() {
+    remember_json_schema_capability(false);
+    if attempt == 0 {
+      last_empty_response = true;
+      continue;
+    }
+    return Err(AppError::Message("AI 服务暂时没有返回内容，请稍后重新划选。".into()));
+  }
+  match serde_json::from_str(output) {
+    Ok(value) => return Ok(value),
+    Err(error) => return Err(AppError::Message(format!("AI 返回 JSON 无效：{error}"))),
+  }
+  }
+  Err(AppError::Message(if last_empty_response {
+    "AI 返回了空内容，已自动重试一次仍未成功。请稍后重新划选。".into()
+  } else {
+    "AI 返回内容无效。请稍后重新划选。".into()
+  }))
 }
 
 fn explanation_schema() -> serde_json::Value {
@@ -613,27 +674,6 @@ fn initial_assessment() -> Vec<AssessmentQuestion> {
   ]
 }
 
-fn sample_article() -> Article {
-  Article {
-    id: "sample-kaiyou-reader".into(),
-    title: "ポップカルチャーを読むための小さな入口".into(),
-    source: "KAI-YOU（接続確認用サンプル）".into(),
-    url: "https://kai-you.net/".into(),
-    published_at: Local::now().format("%Y-%m-%d").to_string(),
-    paragraphs: vec![
-      "ポップカルチャーの記事を読むとき、大切なのは、知らない言葉をすべてすぐに訳すことではありません。まず、文章が何について書かれているのかを考えます。".into(),
-      "アニメ、ゲーム、バーチャル配信者についての記事には、作品名や人名が多く出てきます。しかし、固有名詞が分からなくても、筆者が紹介している出来事や意見を追うことはできます。".into(),
-      "分からない表現に出会ったら、前後の文を読んでから短いヒントを使いましょう。中国語の訳は、どうしても必要なときだけ開くための安全網です。".into(),
-      "毎日一つの記事を最後まで読む経験は、少しずつ文章の流れをつかむ力につながります。今日分からなかった言葉も、別の記事で再会したときに、自分で理解できるようになるかもしれません。".into(),
-    ],
-    images: vec![],
-    embeds: vec![],
-    reading_minutes: 10,
-    difficulty: "N3–N2".into(),
-    is_exploration: false,
-  }
-}
-
 fn article_from_row(row: &rusqlite::Row<'_>) -> Result<Article, rusqlite::Error> {
   let paragraphs_json: String = row.get("paragraphs_json")?;
   let images_json: String = row.get("images_json")?;
@@ -676,6 +716,18 @@ fn save_article(conn: &Connection, article: &Article) -> Result<(), AppError> {
       article.is_exploration as i64,
     ],
   )?;
+  Ok(())
+}
+
+fn is_sample_article(article: &Article) -> bool {
+  article.id == "sample-kaiyou-reader" || article.source.contains("接続確認用サンプル")
+}
+
+fn remove_article_and_learning_artifacts(conn: &Connection, article_id: &str) -> Result<(), AppError> {
+  conn.execute("DELETE FROM selections WHERE article_id = ?1", params![article_id])?;
+  conn.execute("DELETE FROM topic_feedback WHERE article_id = ?1", params![article_id])?;
+  conn.execute("DELETE FROM answers WHERE article_id = ?1", params![article_id])?;
+  conn.execute("DELETE FROM articles WHERE id = ?1", params![article_id])?;
   Ok(())
 }
 
@@ -791,7 +843,7 @@ async fn fetch_kaiyou_candidates() -> Result<Vec<TitleCandidate>, AppError> {
   let link_selector = Selector::parse("a[href^='/article/']")
     .map_err(|_| AppError::Message("无法解析 KAI-YOU 首页".into()))?;
   let mut seen = HashSet::new();
-  let candidates = document
+  let mut candidates = document
     .select(&link_selector)
     .filter_map(|link| {
         let title = link.text().collect::<Vec<_>>().join(" ").trim().to_string();
@@ -806,8 +858,14 @@ async fn fetch_kaiyou_candidates() -> Result<Vec<TitleCandidate>, AppError> {
           source: "KAI-YOU".into(),
         })
     })
-    .take(12)
     .collect::<Vec<_>>();
+  // The homepage mixes navigation, featured stories and older links in DOM order.
+  // Restricting the first dozen links made the daily task fail whenever those few
+  // pages were short, restricted, or already read. Article IDs are chronological.
+  candidates.sort_by_key(|candidate| {
+    Reverse(candidate.url.rsplit('/').next().and_then(|id| id.parse::<u64>().ok()).unwrap_or_default())
+  });
+  candidates.truncate(80);
   if candidates.is_empty() {
     return Err(AppError::Message("KAI-YOU 首页没有找到可读文章".into()));
   }
@@ -828,6 +886,20 @@ async fn fetch_personalized_kaiyou_article(db_path: &PathBuf) -> Result<Article,
   article.difficulty = difficulty;
   article.is_exploration = exploration;
   Ok(article)
+}
+
+async fn fetch_personalized_kaiyou_article_with_retry(db_path: &PathBuf) -> Result<Article, AppError> {
+  let mut last_error = None;
+  for attempt in 0..3 {
+    match fetch_personalized_kaiyou_article(db_path).await {
+      Ok(article) => return Ok(article),
+      Err(error) => {
+        last_error = Some(error);
+        if attempt < 2 { std::thread::sleep(Duration::from_secs(2)); }
+      }
+    }
+  }
+  Err(last_error.unwrap_or_else(|| AppError::Message("没有找到可用的真实文章".into())))
 }
 
 async fn fetch_kaiyou_article_excluding(excluded_urls: &HashSet<String>) -> Result<Article, AppError> {
@@ -948,24 +1020,25 @@ fn submit_initial_assessment(state: State<'_, AppState>, answers: Vec<usize>) ->
 #[tauri::command]
 async fn get_today_article(state: State<'_, AppState>) -> Result<Article, AppError> {
   let today = Local::now().format("%Y-%m-%d").to_string();
-  {
+  let existing = {
     let conn = open_db(&state)?;
     conn.execute(
       "UPDATE articles SET paragraphs_json = '[]', images_json = '[]' WHERE day < ?1",
       params![&today],
     )?;
-    let existing = conn.query_row(
+    conn.query_row(
       "SELECT * FROM articles WHERE day = ?1 ORDER BY rowid DESC LIMIT 1",
       params![&today],
       article_from_row,
-    );
-    if let Ok(article) = existing {
-      return Ok(article);
-    }
+    ).optional()?
+  };
+  if let Some(article) = existing.as_ref().filter(|article| !is_sample_article(article)) {
+    return Ok(article.clone());
   }
 
   let db_path = state.db_path.lock().map_err(|_| AppError::Message("无法访问本地学习数据库".into()))?.clone();
-  let article = fetch_personalized_kaiyou_article(&db_path).await.unwrap_or_else(|_| sample_article());
+  let article = fetch_personalized_kaiyou_article_with_retry(&db_path).await
+    .map_err(|error| AppError::Message(format!("今天的真实文章暂未准备成功：{error}。请稍后重试。")))?;
   let conn = open_db(&state)?;
   let existing = conn.query_row(
     "SELECT * FROM articles WHERE day = ?1 ORDER BY rowid DESC LIMIT 1",
@@ -973,7 +1046,8 @@ async fn get_today_article(state: State<'_, AppState>) -> Result<Article, AppErr
     article_from_row,
   );
   if let Ok(existing_article) = existing {
-    return Ok(existing_article);
+    if !is_sample_article(&existing_article) { return Ok(existing_article); }
+    remove_article_and_learning_artifacts(&conn, &existing_article.id)?;
   }
   save_article(&conn, &article)?;
   Ok(article)
@@ -1000,12 +1074,9 @@ async fn refresh_today_article(state: State<'_, AppState>) -> Result<Article, Ap
   // Fetch before removing the current task. If no suitable unseen article is available,
   // the user keeps the existing one instead of receiving an empty reader.
   let db_path = state.db_path.lock().map_err(|_| AppError::Message("无法访问本地学习数据库".into()))?.clone();
-  let replacement = fetch_personalized_kaiyou_article(&db_path).await?;
+  let replacement = fetch_personalized_kaiyou_article_with_retry(&db_path).await?;
   let conn = open_db(&state)?;
-  conn.execute("DELETE FROM selections WHERE article_id = ?1", params![&current_id])?;
-  conn.execute("DELETE FROM topic_feedback WHERE article_id = ?1", params![&current_id])?;
-  conn.execute("DELETE FROM answers WHERE article_id = ?1", params![&current_id])?;
-  conn.execute("DELETE FROM articles WHERE id = ?1", params![&current_id])?;
+  remove_article_and_learning_artifacts(&conn, &current_id)?;
   save_article(&conn, &replacement)?;
   Ok(replacement)
 }
@@ -1026,7 +1097,7 @@ async fn explain_selection(
 
   let selection = selection.trim();
   if let Some(api_key) = get_api_key() {
-    let system = "你是面向中国母语者的日语阅读教练。用户划选了真实日文文章中的一段。不要输出日语释义。所有 translation、contextNote、exampleTranslation、grammarNote 必须用简洁中文。reading 必须完整复现用户划选文本，并为其中每个汉字词补括号假名，例如「文化祭（ぶんかさい）のような」；绝不使用罗马音，不能遗漏读音。translation 必须结合完整上下文，而不是孤立词典义。example 给一个自然的日语例句来帮助理解；grammarNote 用中文说明相关语法或搭配，没有必要时写“无特殊语法，注意语境搭配”。不要编造原文事实，所有字段保持简短。";
+    let system = "你是面向中国母语者的日语阅读教练。用户划选了真实日文文章中的一段。不要输出日语释义。translation、contextNote、exampleTranslation、grammarNote 必须用简洁中文。reading 必须完整复现用户划选文本，并为其中每个汉字词补括号假名，例如「文化祭（ぶんかさい）のような」；绝不使用罗马音。translation 必须结合完整上下文。为提高即时反馈速度：translation 最多 28 个汉字，contextNote 最多 35 个汉字；example 最多 40 个日文字符，exampleTranslation 最多 30 个汉字；grammarNote 最多 35 个汉字。没有必要的例句或语法时，对应字段返回空字符串。不要编造原文事实。";
     let user = format!(
       "划选文本：{selection}\n完整所在句/上下文：{context}"
     );
@@ -1045,7 +1116,7 @@ async fn explain_selection(
 #[tauri::command]
 fn get_ai_status() -> AiStatus {
   AiStatus {
-    configured: get_api_key().is_some(),
+    configured: ai_is_configured_without_keychain_access(),
     model: get_model(),
     base_url: get_base_url(),
     protocol: get_protocol(),
@@ -1115,6 +1186,7 @@ fn save_openai_api_key(api_key: String, base_url: String, model: String, protoco
     base_url: Some(normalized_base_url.to_owned()),
     model: Some(normalized_model.to_owned()),
     protocol: Some(normalized_protocol.to_owned()),
+    api_key_saved: Some(true),
   })?;
   Ok(())
 }
@@ -1122,7 +1194,7 @@ fn save_openai_api_key(api_key: String, base_url: String, model: String, protoco
 #[tauri::command]
 async fn generate_questions(article: Article, learned_expressions: Vec<String>) -> Result<Vec<Question>, AppError> {
   if let Some(api_key) = get_api_key() {
-    let system = "你是日语阅读测验设计者。根据用户刚读完的真实文章生成恰好三道日语四选一理解题。每一题的正确答案必须仅凭文章得出；evidence 必须逐字引用文章中支持正确答案的一段。错误选项要合理但不能被原文支持。不要问文章外知识，不要剧透，不要使用中文。如果提供了历史划词表达，并且某题确实需要理解该表达才能回答，把该表达原样写入 testedExpressions；否则必须为空数组，禁止虚假绑定。";
+    let system = "你是日语阅读测验设计者。根据用户刚读完的真实文章生成恰好三道日语四选一理解题。prompt 和 choices 必须是日语；正确答案必须仅凭文章得出；evidence 必须逐字引用文章中支持正确答案的一段。错误选项要合理但不能被原文支持。explanation 必须用简洁中文解释正确理由，并且必须以“解析：”开头。不要问文章外知识，不要剧透。如果提供了历史划词表达，并且某题确实需要理解该表达才能回答，把该表达原样写入 testedExpressions；否则必须为空数组，禁止虚假绑定。";
     let user = format!(
       "文章标题：{}\n在本文再次出现的历史划词表达：{}\n文章正文：\n{}",
       article.title,
@@ -1149,7 +1221,10 @@ async fn get_questions(state: State<'_, AppState>, article: Article) -> Result<V
       "SELECT questions_json FROM article_questions WHERE article_id = ?1",
       params![article.id], |row| row.get::<_, String>(0)
     ).optional()? {
-      return serde_json::from_str(&stored).map_err(|_| AppError::Message("已保存的理解题数据损坏".into()));
+      let questions: Vec<Question> = serde_json::from_str(&stored).map_err(|_| AppError::Message("已保存的理解题数据损坏".into()))?;
+      if questions.iter().all(|question| question.explanation.starts_with("解析：")) {
+        return Ok(questions);
+      }
     }
   }
   let text = article.paragraphs.join("\n");
@@ -1184,7 +1259,7 @@ fn fallback_questions(article: &Article) -> Vec<Question> {
     ],
     answer_index: 0,
     evidence,
-    explanation: "本地保守题：正确选项直接摘自原文首段；配置 API Key 后将生成三道有区分度的证据绑定题。".into(),
+    explanation: "解析：正确选项直接摘自原文首段；配置 API Key 后将生成三道有区分度的证据绑定题。".into(),
     tested_expressions: vec![],
   }]
 }
@@ -1236,7 +1311,8 @@ async fn get_weekly_assessment(state: State<'_, AppState>) -> Result<WeeklyAsses
     }
     urls
   };
-  let article = fetch_kaiyou_article_excluding(&used_urls).await.unwrap_or_else(|_| sample_article());
+  let article = fetch_kaiyou_article_excluding(&used_urls).await
+    .map_err(|error| AppError::Message(format!("本周独立评估的真实文章暂未准备成功：{error}。请稍后重试。")))?;
   let questions = match generate_questions(article.clone(), vec![]).await {
     Ok(items) => items,
     Err(_) => fallback_questions(&article),
@@ -1440,20 +1516,28 @@ pub fn run() {
       app.manage(AppState { db_path: Mutex::new(data_dir.join("learning.sqlite3")) });
       if std::env::args().any(|argument| argument == "--daily-reminder") {
         let db_path = data_dir.join("learning.sqlite3");
-        let mut title = Connection::open(&db_path).ok().and_then(|conn| conn.query_row("SELECT title FROM articles WHERE day = date('now', 'localtime') ORDER BY rowid DESC LIMIT 1", [], |row| row.get::<_, String>(0)).ok());
+        let existing = Connection::open(&db_path).ok().and_then(|conn| conn.query_row(
+          "SELECT * FROM articles WHERE day = date('now', 'localtime') ORDER BY rowid DESC LIMIT 1",
+          [],
+          article_from_row,
+        ).ok());
+        let mut title = existing.as_ref().filter(|article| !is_sample_article(article)).map(|article| article.title.clone());
         if title.is_none() {
           // The reminder may be the first process to create today's task. It must use the
           // same history-aware selection path as the reader; otherwise it can re-save
           // yesterday's top homepage article before the main app has a chance to filter it.
-          if let Ok(article) = tauri::async_runtime::block_on(fetch_personalized_kaiyou_article(&db_path)) {
+          if let Ok(article) = tauri::async_runtime::block_on(fetch_personalized_kaiyou_article_with_retry(&db_path)) {
             if let Ok(conn) = Connection::open(&db_path) {
+              if let Some(sample) = existing.as_ref().filter(|article| is_sample_article(article)) {
+                let _ = remove_article_and_learning_artifacts(&conn, &sample.id);
+              }
               let _ = save_article(&conn, &article);
               title = Some(article.title);
             }
           }
         }
-        let title = title.unwrap_or_else(|| "今天的日语阅读已经准备好了".into());
-        let _ = app.notification().builder().title("日语阅读日报").body(title).show();
+        let title = title.unwrap_or_else(|| "今天的真实文章暂未准备完成，打开 App 后会自动重试".into());
+        let _ = app.notification().builder().title("Kotoba Atelier").body(title).show();
         app.handle().exit(0);
       }
       Ok(())
@@ -1483,7 +1567,7 @@ pub fn run() {
       ,update_target_level
     ])
     .run(tauri::generate_context!())
-    .expect("启动日语阅读日报失败");
+    .expect("启动 Kotoba Atelier 失败");
 }
 
 #[cfg(test)]
@@ -1571,14 +1655,24 @@ mod tests {
   fn live_kaiyou_pages_have_at_least_one_compatible_article() {
     tauri::async_runtime::block_on(async {
       let candidates = fetch_kaiyou_candidates().await.unwrap();
-      assert!(candidates.len() >= 3);
-      let client = Client::builder().user_agent("NihongoDailyReader/0.1 (parser smoke test)").build().unwrap();
-      let mut compatible = 0;
-      for candidate in candidates.into_iter().take(6) {
-        let page = client.get(&candidate.url).send().await.unwrap().text().await.unwrap();
-        if parse_kaiyou_article_page(&candidate, &page).unwrap().is_some() { compatible += 1; }
-      }
-      assert!(compatible >= 1, "首页前六篇中没有符合当前解析规则的公开长文");
+      assert!(candidates.len() >= 20);
+      let article = fetch_kaiyou_article_from_candidates(candidates, &HashSet::new()).await.unwrap();
+      assert_eq!(article.source, "KAI-YOU");
+      assert!(article.paragraphs.iter().map(|paragraph| paragraph.chars().count()).sum::<usize>() >= 1200);
+    });
+  }
+
+  #[test]
+  #[ignore = "requires live KAI-YOU network access"]
+  fn live_candidates_can_replace_a_previously_read_article() {
+    tauri::async_runtime::block_on(async {
+      let candidates = fetch_kaiyou_candidates().await.unwrap();
+      let mut excluded = HashSet::new();
+      excluded.insert("https://kai-you.net/article/95856".to_string());
+      let article = fetch_kaiyou_article_from_candidates(candidates, &excluded).await.unwrap();
+      assert_ne!(article.url, "https://kai-you.net/article/95856");
+      assert_eq!(article.source, "KAI-YOU");
+      assert!(article.paragraphs.iter().map(|paragraph| paragraph.chars().count()).sum::<usize>() >= 1200);
     });
   }
 

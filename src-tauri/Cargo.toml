@@ -1,12 +1,12 @@
 [package]
-name = "nihongo-daily-reader"
+name = "kotoba-atelier"
 version = "0.1.0"
 description = "Personal AI Japanese reading daily"
 authors = ["xtnntn"]
 edition = "2021"
 
 [lib]
-name = "nihongo_daily_reader_lib"
+name = "kotoba_atelier_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [build-dependencies]
