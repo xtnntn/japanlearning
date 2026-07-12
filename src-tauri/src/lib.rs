@@ -1,4 +1,5 @@
-use chrono::{Datelike, Local, NaiveDate};
+use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate};
+use futures_util::stream::{self, StreamExt};
 use reqwest::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use scraper::{Html, Selector};
@@ -40,7 +41,6 @@ struct AppState {
     db_path: Mutex<PathBuf>,
 }
 
-static API_KEY_CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static LOCAL_AI_SETTINGS: OnceLock<Mutex<LocalAiSettings>> = OnceLock::new();
 static API_HTTP_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
 static CHAT_JSON_SCHEMA_CAPABILITY: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
@@ -50,7 +50,7 @@ struct LocalAiSettings {
     base_url: Option<String>,
     model: Option<String>,
     protocol: Option<String>,
-    api_key_saved: Option<bool>,
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +123,17 @@ struct Explanation {
     example: String,
     example_translation: String,
     grammar_note: String,
+    #[serde(default)]
+    review_candidates: Vec<ReviewCardDraft>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewCardDraft {
+    front: String,
+    reading: String,
+    translation: String,
+    context_note: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -241,6 +252,18 @@ struct MultiAgentPlanDraft {
     rationale: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewCard {
+    id: String,
+    front: String,
+    reading: String,
+    translation: String,
+    context_note: String,
+    article_title: String,
+    review_count: i64,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TopicFeedback {
@@ -280,6 +303,20 @@ fn open_db(state: &AppState) -> Result<Connection, AppError> {
         selection TEXT NOT NULL,
         context TEXT NOT NULL,
         chinese_revealed INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS review_cards (
+        id TEXT PRIMARY KEY,
+        selection_id TEXT NOT NULL UNIQUE,
+        article_id TEXT NOT NULL,
+        front TEXT NOT NULL,
+        reading TEXT NOT NULL,
+        translation TEXT NOT NULL,
+        context_note TEXT NOT NULL,
+        review_count INTEGER NOT NULL DEFAULT 0,
+        interval_days INTEGER NOT NULL DEFAULT 1,
+        due_at TEXT NOT NULL,
+        last_reviewed_at TEXT,
         created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS topic_feedback (
@@ -485,11 +522,6 @@ fn remove_daily_reminder(state: State<'_, AppState>) -> Result<ReminderStatus, A
     })
 }
 
-fn api_key_entry() -> Result<keyring::Entry, AppError> {
-    keyring::Entry::new("com.xtnntn.nihongo-daily-reader", "openai-api-key")
-        .map_err(|error| AppError::Message(format!("无法访问 macOS Keychain：{error}")))
-}
-
 fn local_ai_settings_path() -> Result<PathBuf, AppError> {
     let home =
         std::env::var_os("HOME").ok_or_else(|| AppError::Message("无法定位用户目录".into()))?;
@@ -525,6 +557,9 @@ fn save_local_ai_settings(settings: LocalAiSettings) -> Result<(), AppError> {
             .map_err(|error| AppError::Message(format!("无法编码 AI 设置：{error}")))?,
     )
     .map_err(|error| AppError::Message(format!("无法保存 AI 设置：{error}")))?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|error| AppError::Message(format!("无法收紧 AI 设置文件权限：{error}")))?;
     if let Ok(mut cached) = LOCAL_AI_SETTINGS
         .get_or_init(|| Mutex::new(LocalAiSettings::default()))
         .lock()
@@ -534,59 +569,8 @@ fn save_local_ai_settings(settings: LocalAiSettings) -> Result<(), AppError> {
     Ok(())
 }
 
-fn keychain_fallback_password(account: &str) -> Option<String> {
-    let output = Command::new("/usr/bin/security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "com.xtnntn.nihongo-daily-reader",
-            "-a",
-            account,
-            "-w",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-}
-
-fn cached_keychain_password(
-    cache: &OnceLock<Mutex<Option<String>>>,
-    account: &str,
-    entry: Result<keyring::Entry, AppError>,
-) -> Option<String> {
-    let cache = cache.get_or_init(|| Mutex::new(None));
-    if let Ok(guard) = cache.lock() {
-        if let Some(value) = guard.clone() {
-            return Some(value);
-        }
-    }
-    let value = entry
-        .ok()
-        .and_then(|entry| entry.get_password().ok())
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| keychain_fallback_password(account));
-    if let Some(value) = value.as_ref() {
-        if let Ok(mut guard) = cache.lock() {
-            *guard = Some(value.clone());
-        }
-    }
-    value
-}
-
-fn cache_password(cache: &OnceLock<Mutex<Option<String>>>, value: String) {
-    if let Ok(mut guard) = cache.get_or_init(|| Mutex::new(None)).lock() {
-        *guard = Some(value);
-    }
-}
-
 fn get_api_key() -> Option<String> {
-    cached_keychain_password(&API_KEY_CACHE, "openai-api-key", api_key_entry())
+    local_ai_settings().api_key.filter(|key| !key.trim().is_empty())
 }
 
 fn get_base_url() -> String {
@@ -610,9 +594,7 @@ fn get_protocol() -> String {
 
 fn ai_is_configured_without_keychain_access() -> bool {
     let settings = local_ai_settings();
-    settings.api_key_saved.unwrap_or_else(|| {
-        settings.base_url.is_some() && settings.model.is_some() && settings.protocol.is_some()
-    })
+    settings.api_key.is_some() && settings.base_url.is_some() && settings.model.is_some() && settings.protocol.is_some()
 }
 
 fn responses_url(base_url: &str) -> Result<String, AppError> {
@@ -845,8 +827,9 @@ fn explanation_schema() -> serde_json::Value {
         "example": { "type": "string" },
         "exampleTranslation": { "type": "string" },
         "grammarNote": { "type": "string" }
+        ,"reviewCandidates": { "type": "array", "maxItems": 2, "items": { "type": "object", "additionalProperties": false, "properties": { "front": { "type": "string" }, "reading": { "type": "string" }, "translation": { "type": "string" }, "contextNote": { "type": "string" } }, "required": ["front", "reading", "translation", "contextNote"] } }
       },
-      "required": ["reading", "translation", "contextNote", "example", "exampleTranslation", "grammarNote"]
+      "required": ["reading", "translation", "contextNote", "example", "exampleTranslation", "grammarNote", "reviewCandidates"]
     })
 }
 
@@ -965,6 +948,10 @@ fn remove_article_and_learning_artifacts(
     conn: &Connection,
     article_id: &str,
 ) -> Result<(), AppError> {
+    conn.execute(
+        "DELETE FROM review_cards WHERE article_id = ?1",
+        params![article_id],
+    )?;
     conn.execute(
         "DELETE FROM selections WHERE article_id = ?1",
         params![article_id],
@@ -1353,7 +1340,28 @@ async fn fetch_personalized_kaiyou_article(db_path: &PathBuf) -> Result<Article,
             .collect();
         (candidates, difficulty, used_urls)
     };
-    let mut article = fetch_kaiyou_article_from_candidates(candidates, &used_urls).await?;
+    let mut article = match fetch_kaiyou_article_from_candidates(candidates.clone(), &used_urls).await {
+        Ok(article) => article,
+        Err(_) => {
+            // The homepage only exposes a small, volatile slice of stories. When its
+            // few long editorial pieces are already read, walk recent numeric article
+            // IDs to recover an unseen public long-form article without recycling history.
+            let highest_id = candidates.iter().filter_map(|candidate| {
+                candidate.url.rsplit('/').next()?.parse::<u64>().ok()
+            }).max().unwrap_or_default();
+            let archive_candidates = (1..=180)
+                .map(|offset| highest_id.saturating_sub(offset))
+                .filter(|id| *id > 0)
+                .map(|id| TitleCandidate {
+                    id: format!("article-{id}"),
+                    title: "KAI-YOU 近期归档文章".into(),
+                    url: format!("https://kai-you.net/article/{id}"),
+                    source: "KAI-YOU".into(),
+                })
+                .collect();
+            fetch_kaiyou_article_from_candidates(archive_candidates, &used_urls).await?
+        }
+    };
     article.difficulty = difficulty;
     article.is_exploration = exploration;
     Ok(article)
@@ -1363,13 +1371,15 @@ async fn fetch_personalized_kaiyou_article_with_retry(
     db_path: &PathBuf,
 ) -> Result<Article, AppError> {
     let mut last_error = None;
-    for attempt in 0..3 {
+    let backoff = [2u64, 4, 8];
+    for attempt in 0..4 {
         match fetch_personalized_kaiyou_article(db_path).await {
             Ok(article) => return Ok(article),
             Err(error) => {
                 last_error = Some(error);
-                if attempt < 2 {
-                    std::thread::sleep(Duration::from_secs(2));
+                if attempt < 3 {
+                    let delay = backoff.get(attempt).copied().unwrap_or(8);
+                    std::thread::sleep(Duration::from_secs(delay));
                 }
             }
         }
@@ -1483,6 +1493,14 @@ fn parse_kaiyou_article_page(
             break;
         }
     }
+    let title_selector = Selector::parse("meta[property='og:title']")
+        .map_err(|_| AppError::Message("无法解析文章标题".into()))?;
+    let title = article_document.select(&title_selector)
+        .find_map(|node| node.value().attr("content"))
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| candidate.title.clone());
     let published_at = article_document
         .select(&published_selector)
         .find_map(|node| {
@@ -1494,7 +1512,7 @@ fn parse_kaiyou_article_page(
         .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
     Ok(Some(Article {
         id: format!("kaiyou-{}", Uuid::new_v4()),
-        title: candidate.title.clone(),
+        title,
         source: "KAI-YOU".into(),
         url: candidate.url.clone(),
         published_at,
@@ -1514,18 +1532,36 @@ async fn fetch_kaiyou_article_from_candidates(
     let client = Client::builder()
         .user_agent("NihongoDailyReader/0.1 (personal learning reader)")
         .build()?;
-    for candidate in candidates {
-        if excluded_urls.contains(&candidate.url) {
-            continue;
+    let candidates = candidates.into_iter()
+        .filter(|candidate| !excluded_urls.contains(&candidate.url))
+        .collect::<Vec<_>>();
+    let mut pages = stream::iter(candidates.into_iter().map(|candidate| {
+        let client = client.clone();
+        async move {
+            let page = match client.get(&candidate.url).send().await
+                .and_then(|response| response.error_for_status()) {
+                Ok(response) => response.text().await,
+                Err(error) => Err(error),
+            };
+            (candidate, page)
         }
-        let page = client.get(&candidate.url).send().await?.text().await?;
+    })).buffer_unordered(6);
+    let mut last_fetch_error: Option<String> = None;
+    while let Some((candidate, page)) = pages.next().await {
+        let page = match page {
+            Ok(page) => page,
+            Err(error) => { last_fetch_error = Some(error.to_string()); continue; }
+        };
         if let Some(article) = parse_kaiyou_article_page(&candidate, &page)? {
             return Ok(article);
         }
     }
-    Err(AppError::Message(
-        "没有找到未读且正文足够长的 KAI-YOU 文章".into(),
-    ))
+    Err(AppError::Message(match last_fetch_error {
+        Some(error) => format!(
+            "没有找到未读且正文足够长的 KAI-YOU 文章（最后一次抓取失败：{error}）"
+        ),
+        None => "没有找到未读且正文足够长的 KAI-YOU 文章".into(),
+    }))
 }
 
 #[tauri::command]
@@ -1671,6 +1707,81 @@ async fn refresh_today_article(state: State<'_, AppState>) -> Result<Article, Ap
     Ok(replacement)
 }
 
+fn next_due_review_card(conn: &Connection) -> Result<Option<ReviewCard>, AppError> {
+    conn.query_row(
+        "SELECT c.id, c.front, c.reading, c.translation, c.context_note, a.title, c.review_count
+         FROM review_cards c JOIN articles a ON a.id = c.article_id
+         WHERE c.due_at <= ?1 ORDER BY c.due_at ASC, c.created_at ASC LIMIT 1",
+        params![Local::now().to_rfc3339()],
+        |row| Ok(ReviewCard {
+            id: row.get(0)?, front: row.get(1)?, reading: row.get(2)?, translation: row.get(3)?,
+            context_note: row.get(4)?, article_title: row.get(5)?, review_count: row.get(6)?,
+        }),
+    ).optional().map_err(AppError::from)
+}
+
+#[tauri::command]
+fn get_review_cards(state: State<'_, AppState>) -> Result<Vec<ReviewCard>, AppError> {
+    let conn = open_db(&state)?;
+    let mut statement = conn.prepare(
+        "SELECT c.id, c.front, c.reading, c.translation, c.context_note, a.title, c.review_count
+         FROM review_cards c JOIN articles a ON a.id = c.article_id
+         ORDER BY c.due_at ASC, c.created_at DESC LIMIT 60"
+    )?;
+    let cards = statement.query_map([], |row| Ok(ReviewCard {
+        id: row.get(0)?, front: row.get(1)?, reading: row.get(2)?, translation: row.get(3)?,
+        context_note: row.get(4)?, article_title: row.get(5)?, review_count: row.get(6)?,
+    }))?.filter_map(Result::ok).collect::<Vec<_>>();
+    Ok(cards)
+}
+
+fn save_review_cards(conn: &Connection, selection_id: &str, article_id: &str, candidates: &[ReviewCardDraft]) -> Result<(), AppError> {
+    let now = Local::now();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let front = candidate.front.trim();
+        if front.chars().count() < 2 || front.chars().count() > 30 { continue; }
+        let duplicate: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM review_cards WHERE front = ?1 COLLATE NOCASE)", params![front], |row| row.get(0)
+        )?;
+        if duplicate { continue; }
+        conn.execute(
+            "INSERT INTO review_cards (id, selection_id, article_id, front, reading, translation, context_note, due_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![Uuid::new_v4().to_string(), format!("{selection_id}-{index}"), article_id, front, candidate.reading.trim(), candidate.translation.trim(), candidate.context_note.trim(), (now + ChronoDuration::days(1)).to_rfc3339(), now.to_rfc3339()],
+        )?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_due_review_card(state: State<'_, AppState>) -> Result<Option<ReviewCard>, AppError> {
+    let conn = open_db(&state)?;
+    next_due_review_card(&conn)
+}
+
+#[tauri::command]
+fn review_card(state: State<'_, AppState>, card_id: String, remembered: bool) -> Result<Option<ReviewCard>, AppError> {
+    let conn = open_db(&state)?;
+    let (review_count, previous_interval): (i64, i64) = conn.query_row(
+        "SELECT review_count, interval_days FROM review_cards WHERE id = ?1", params![card_id], |row| Ok((row.get(0)?, row.get(1)?))
+    )?;
+    let interval_days = if remembered {
+        match review_count {
+            0 => 1,
+            1 => 3,
+            2 => 7,
+            3 => 14,
+            _ => (previous_interval * 2).min(60),
+        }
+    } else { 1 };
+    let now = Local::now();
+    conn.execute(
+        "UPDATE review_cards SET review_count = review_count + 1, interval_days = ?1, due_at = ?2, last_reviewed_at = ?3 WHERE id = ?4",
+        params![interval_days, (now + ChronoDuration::days(interval_days)).to_rfc3339(), now.to_rfc3339(), card_id],
+    )?;
+    next_due_review_card(&conn)
+}
+
 #[tauri::command]
 async fn explain_selection(
     state: State<'_, AppState>,
@@ -1678,40 +1789,58 @@ async fn explain_selection(
     selection: String,
     context: String,
 ) -> Result<Explanation, AppError> {
-    let conn = open_db(&state)?;
-    conn.execute(
+    let selection_id = Uuid::new_v4().to_string();
+    let created_at = Local::now().to_rfc3339();
+    {
+        let conn = open_db(&state)?;
+        conn.execute(
         "INSERT INTO selections (id, article_id, selection, context, chinese_revealed, created_at)
      VALUES (?1, ?2, ?3, ?4, 1, ?5)",
         params![
-            Uuid::new_v4().to_string(),
+            selection_id,
             article_id,
             selection,
             context,
-            Local::now().to_rfc3339()
+            created_at
         ],
-    )?;
+        )?;
+    }
 
     let selection = selection.trim();
-    if let Some(api_key) = get_api_key() {
-        let system = "你是面向中国母语者的日语阅读教练。用户划选了真实日文文章中的一段。不要输出日语释义。translation、contextNote、exampleTranslation、grammarNote 必须用简洁中文。reading 必须完整复现用户划选文本，并为其中每个汉字词补括号假名，例如「文化祭（ぶんかさい）のような」；绝不使用罗马音。translation 必须结合完整上下文。为提高即时反馈速度：translation 最多 28 个汉字，contextNote 最多 35 个汉字；example 最多 40 个日文字符，exampleTranslation 最多 30 个汉字；grammarNote 最多 35 个汉字。没有必要的例句或语法时，对应字段返回空字符串。不要编造原文事实。";
-        let user = format!("划选文本：{selection}\n完整所在句/上下文：{context}");
-        return generate_structured(
+    let existing_cards = {
+        let conn = open_db(&state)?;
+        let mut statement = conn.prepare("SELECT front FROM review_cards ORDER BY created_at DESC LIMIT 60")?;
+        let cards = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        cards
+    };
+    let explanation = if let Some(api_key) = get_api_key() {
+        let system = "你是面向中国母语者的日语阅读教练。用户划选了真实日文文章中的一段。不要输出日语释义。translation、contextNote、exampleTranslation、grammarNote 必须用简洁中文。reading 必须完整复现用户划选文本，并为其中每个汉字词补括号假名，例如「文化祭（ぶんかさい）のような」；绝不使用罗马音。translation 必须结合完整上下文。为提高即时反馈速度：translation 最多 28 个汉字，contextNote 最多 35 个汉字；example 最多 40 个日文字符，exampleTranslation 最多 30 个汉字；grammarNote 最多 35 个汉字。没有必要的例句或语法时，对应字段返回空字符串。不要编造原文事实。reviewCandidates 是给间隔复习用的候选卡：只保留可复用、存在学习价值的核心词、短语或语法搭配；整句、专有名词、过于简单的词、与已有卡重复或语义近重复时返回空数组。必要时把用户的长划选拆成最多两张独立的短表达卡；front 必须是原文中连续出现的日语表达。";
+        let user = format!("划选文本：{selection}\n完整所在句/上下文：{context}\n已有卡正面（避免重复）：{}", if existing_cards.is_empty() { "暂无".into() } else { existing_cards.join("、") });
+        generate_structured(
             &api_key,
             system,
             &user,
             "selection_explanation",
             explanation_schema(),
         )
-        .await;
-    }
-    Ok(Explanation {
-        reading: format!("{selection}（需要配置 AI 才能生成准确假名读音）"),
-        translation: "当前未配置 AI，无法生成结合上下文的准确译文。".into(),
-        context_note: "请先配置 AI，再重新划选该片段。".into(),
-        example: "例句需要结合具体表达生成。".into(),
-        example_translation: "配置 AI 后会给出对应例句翻译。".into(),
-        grammar_note: "配置 AI 后会补充相关语法或搭配。".into(),
-    })
+        .await?
+    } else {
+        Explanation {
+            reading: format!("{selection}（需要配置 AI 才能生成准确假名读音）"),
+            translation: "当前未配置 AI，无法生成结合上下文的准确译文。".into(),
+            context_note: "请先配置 AI，再重新划选该片段。".into(),
+            example: "例句需要结合具体表达生成。".into(),
+            example_translation: "配置 AI 后会给出对应例句翻译。".into(),
+            grammar_note: "配置 AI 后会补充相关语法或搭配。".into(),
+            review_candidates: vec![],
+        }
+    };
+    let conn = open_db(&state)?;
+    save_review_cards(&conn, &selection_id, &article_id, &explanation.review_candidates)?;
+    Ok(explanation)
 }
 
 #[tauri::command]
@@ -1798,17 +1927,12 @@ fn save_openai_api_key(
     {
         return Err(AppError::Message("模型名称不能为空，且不能包含空格".into()));
     }
-    if !cleaned.is_empty() {
-        api_key_entry()?
-            .set_password(cleaned)
-            .map_err(|error| AppError::Message(format!("无法保存到 macOS Keychain：{error}")))?;
-        cache_password(&API_KEY_CACHE, cleaned.to_owned());
-    }
+    let stored_api_key = if cleaned.is_empty() { get_api_key().unwrap_or_default() } else { cleaned.to_owned() };
     save_local_ai_settings(LocalAiSettings {
         base_url: Some(normalized_base_url.to_owned()),
         model: Some(normalized_model.to_owned()),
         protocol: Some(normalized_protocol.to_owned()),
-        api_key_saved: Some(true),
+        api_key: Some(stored_api_key),
     })?;
     Ok(())
 }
@@ -2395,6 +2519,9 @@ pub fn run() {
             get_weekly_assessment,
             submit_weekly_assessment,
             explain_selection,
+            get_due_review_card,
+            get_review_cards,
+            review_card,
             get_ai_status,
             discover_models,
             save_openai_api_key,
@@ -2440,6 +2567,25 @@ mod tests {
             responses_url("https://api.example.com/v1").unwrap(),
             "https://api.example.com/v1/responses"
         );
+    }
+
+    #[test]
+    fn due_review_card_is_returned_in_oldest_due_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE articles (id TEXT PRIMARY KEY, title TEXT NOT NULL);
+             CREATE TABLE review_cards (
+               id TEXT PRIMARY KEY, selection_id TEXT UNIQUE, article_id TEXT, front TEXT, reading TEXT,
+               translation TEXT, context_note TEXT, review_count INTEGER, interval_days INTEGER,
+               due_at TEXT, last_reviewed_at TEXT, created_at TEXT
+             );
+             INSERT INTO articles VALUES ('a1', '旧文章');
+             INSERT INTO review_cards VALUES ('card-1', 'selection-1', 'a1', '企画', '企画（きかく）', '策划', '文章中的项目安排', 2, 3, '2000-01-01T00:00:00+00:00', NULL, '1999-01-01T00:00:00+00:00');",
+        ).unwrap();
+        let card = next_due_review_card(&conn).unwrap().unwrap();
+        assert_eq!(card.id, "card-1");
+        assert_eq!(card.front, "企画");
+        assert_eq!(card.review_count, 2);
     }
 
     #[test]
@@ -2632,14 +2778,4 @@ mod tests {
         });
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_keychain_backend_round_trip() {
-        let account = format!("keychain-roundtrip-{}", Uuid::new_v4());
-        let entry = keyring::Entry::new("com.xtnntn.nihongo-daily-reader.tests", &account).unwrap();
-        entry.set_password("temporary-test-value").unwrap();
-        assert_eq!(entry.get_password().unwrap(), "temporary-test-value");
-        entry.delete_credential().unwrap();
-        assert!(entry.get_password().is_err());
-    }
 }
