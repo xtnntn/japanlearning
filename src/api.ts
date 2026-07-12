@@ -49,6 +49,7 @@ export type Progress = {
 };
 export type ReminderStatus = { enabled: boolean; hour: number; minute: number };
 export type AbilityProfile = { suggestedLevel: string; targetLevel?: string; initialScore?: number; dailyAccuracy?: number; weeklyAccuracy?: number; selectionCount: number; chineseRevealRate?: number; completedArticles: number };
+export type MultiAgentPlan = { targetDifficulty: string; focusTerms: string[]; avoidTerms: string[]; articleBrief: string; questionBrief: string; rationale: string; updatedAt: string };
 
 export type TitleCandidate = { id: string; title: string; url: string; source: string };
 export type AssessmentQuestion = { id: string; prompt: string; choices: string[]; answerIndex: number };
@@ -83,4 +84,6 @@ export const api = {
   ,removeDailyReminder: () => invoke<ReminderStatus>("remove_daily_reminder")
   ,getAbilityProfile: () => invoke<AbilityProfile>("get_ability_profile")
   ,updateTargetLevel: (targetLevel?: string) => invoke<AbilityProfile>("update_target_level", { targetLevel: targetLevel || null })
+  ,getMultiAgentPlan: () => invoke<MultiAgentPlan | null>("get_multi_agent_plan")
+  ,refreshMultiAgentPlan: () => invoke<MultiAgentPlan>("refresh_multi_agent_plan")
 };

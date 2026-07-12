@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, type AbilityProfile, type AiStatus, type Article, type AssessmentQuestion, type AssessmentResult, type Explanation, type Progress, type Question, type ReminderStatus, type TitleCandidate, type WeeklyAssessment } from "./api";
+import { api, type AbilityProfile, type AiStatus, type Article, type AssessmentQuestion, type AssessmentResult, type Explanation, type MultiAgentPlan, type Progress, type Question, type ReminderStatus, type TitleCandidate, type WeeklyAssessment } from "./api";
 
 const feedbackOptions = [
   "想多读这个题材",
@@ -31,6 +31,8 @@ export default function App() {
   const [showProgress, setShowProgress] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
   const [abilityProfile, setAbilityProfile] = useState<AbilityProfile>();
+  const [multiAgentPlan, setMultiAgentPlan] = useState<MultiAgentPlan | null>();
+  const [refreshingAgentPlan, setRefreshingAgentPlan] = useState(false);
   const [targetLevel, setTargetLevel] = useState("");
   const [profileMessage, setProfileMessage] = useState<string>();
   const [reminder, setReminder] = useState<ReminderStatus>({ enabled: false, hour: 9, minute: 0 });
@@ -272,12 +274,24 @@ export default function App() {
 
   const openProfile = async () => {
     try {
-      const profile = await api.getAbilityProfile();
+      const [profile, plan] = await Promise.all([api.getAbilityProfile(), api.getMultiAgentPlan()]);
       setAbilityProfile(profile);
+      setMultiAgentPlan(plan);
       setTargetLevel(profile.targetLevel ?? "");
       setProfileMessage(undefined);
       setShowProfile(true);
     } catch (reason) { setError(String(reason)); }
+  };
+
+  const refreshAgentPlan = async () => {
+    setRefreshingAgentPlan(true);
+    setProfileMessage(undefined);
+    try {
+      const plan = await api.refreshMultiAgentPlan();
+      setMultiAgentPlan(plan);
+      setProfileMessage("学习策略已更新；下一篇选文与新题目会使用它。");
+    } catch (reason) { setProfileMessage(String(reason)); }
+    finally { setRefreshingAgentPlan(false); }
   };
 
   const saveTargetLevel = async () => {
@@ -467,7 +481,7 @@ export default function App() {
               <div className="wide-field"><label className="field-label" htmlFor="api-key">访问密钥 <em>API Key</em></label><input id="api-key" type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setAvailableModels([]); }} placeholder={aiStatus?.configured ? "密钥已安全保存；仅在替换时输入" : "粘贴 API Key"} autoComplete="off" /></div>
             </div>
             <div className="settings-actions"><button className="detect-models" onClick={() => void detectModels()} disabled={!baseUrl.trim() || (!apiKey.trim() && !aiStatus?.configured) || detectingModels}>{detectingModels ? "正在刷新…" : "刷新模型列表"}</button><button className="save-key" onClick={() => void saveKey()} disabled={!baseUrl.trim() || availableModels.length === 0 || (!apiKey.trim() && !aiStatus?.configured)}>保存连接</button></div>
-            <p className="settings-note">只有访问密钥会使用 macOS Keychain；其他配置只保存在本机。tokendance 网关请使用 Chat Completions。</p>
+<p className="settings-note">仅允许 HTTPS 网关。划词时会发送所划文本及附近上下文；生成理解题会发送当前文章全文和历史划词表达；生成学习策略会发送本地成绩、划词汇总与题材反馈。只有 API Key 使用 macOS Keychain；其他配置只保存在本机。tokendance 网关请使用 Chat Completions。</p>
           </section>
           {keyMessage && <p className="key-message">{keyMessage}</p>}
           <section className="settings-section reminder-section">
@@ -532,6 +546,16 @@ export default function App() {
             <div><span>独立周测</span><strong>{abilityProfile.weeklyAccuracy == null ? "证据不足" : `${Math.round(abilityProfile.weeklyAccuracy * 100)}%`}</strong></div>
             <div><span>中文展开率</span><strong>{abilityProfile.chineseRevealRate == null ? "证据不足" : `${Math.round(abilityProfile.chineseRevealRate * 100)}%`}</strong></div>
           </div>
+          <section className="agent-plan-card">
+            <div className="agent-plan-heading"><div><p className="eyebrow">学习策略编排</p><h4>下一阶段学习策略</h4></div><button className="secondary-action" onClick={() => void refreshAgentPlan()} disabled={refreshingAgentPlan}>{refreshingAgentPlan ? "正在分析…" : multiAgentPlan ? "更新策略" : "生成策略"}</button></div>
+            {multiAgentPlan ? <>
+              <p><strong>学习分析师</strong>{multiAgentPlan.rationale}</p>
+              <p><strong>内容策展人</strong>{multiAgentPlan.articleBrief}</p>
+              <p><strong>出题教练</strong>{multiAgentPlan.questionBrief}</p>
+              <div className="agent-plan-tags"><span>目标 {multiAgentPlan.targetDifficulty}</span>{multiAgentPlan.focusTerms.map((term) => <span key={term}>{term}</span>)}</div>
+              {multiAgentPlan.avoidTerms.length > 0 && <p className="agent-plan-caution"><strong>暂缓</strong>{multiAgentPlan.avoidTerms.join("、")}</p>}
+            </> : <p className="agent-plan-empty">根据你的划词、题目、完成与题材反馈，生成下一篇文章和下一组题目的协作策略。</p>}
+          </section>
           <label className="field-label" htmlFor="target-level">未来文章目标难度</label>
           <select id="target-level" value={targetLevel} onChange={(event) => setTargetLevel(event.target.value)}>
             <option value="">自动判断</option>
