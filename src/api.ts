@@ -49,6 +49,8 @@ export type Progress = {
 };
 export type ReminderStatus = { enabled: boolean; hour: number; minute: number };
 export type AbilityProfile = { suggestedLevel: string; targetLevel?: string; initialScore?: number; dailyAccuracy?: number; weeklyAccuracy?: number; selectionCount: number; chineseRevealRate?: number; completedArticles: number };
+export type MultiAgentPlan = { targetDifficulty: string; focusTerms: string[]; avoidTerms: string[]; articleBrief: string; questionBrief: string; rationale: string; updatedAt: string };
+export type ReviewCard = { id: string; front: string; reading: string; translation: string; contextNote: string; articleTitle: string; reviewCount: number };
 
 export type TitleCandidate = { id: string; title: string; url: string; source: string };
 export type AssessmentQuestion = { id: string; prompt: string; choices: string[]; answerIndex: number };
@@ -62,6 +64,9 @@ export const api = {
   refreshTodayArticle: () => invoke<Article>("refresh_today_article"),
   explainSelection: (articleId: string, selection: string, context: string) =>
     invoke<Explanation>("explain_selection", { articleId, selection, context }),
+  getDueReviewCard: () => invoke<ReviewCard | null>("get_due_review_card"),
+  getReviewCards: () => invoke<ReviewCard[]>("get_review_cards"),
+  reviewCard: (cardId: string, remembered: boolean) => invoke<ReviewCard | null>("review_card", { cardId, remembered }),
   getQuestions: (article: Article) => invoke<Question[]>("get_questions", { article }),
   recordAnswer: (articleId: string, questionId: string, chosenIndex: number, answerIndex: number, testedExpressions: string[]) =>
     invoke<boolean>("record_answer", { articleId, questionId, chosenIndex, answerIndex, testedExpressions }),
@@ -83,4 +88,6 @@ export const api = {
   ,removeDailyReminder: () => invoke<ReminderStatus>("remove_daily_reminder")
   ,getAbilityProfile: () => invoke<AbilityProfile>("get_ability_profile")
   ,updateTargetLevel: (targetLevel?: string) => invoke<AbilityProfile>("update_target_level", { targetLevel: targetLevel || null })
+  ,getMultiAgentPlan: () => invoke<MultiAgentPlan | null>("get_multi_agent_plan")
+  ,refreshMultiAgentPlan: () => invoke<MultiAgentPlan>("refresh_multi_agent_plan")
 };
