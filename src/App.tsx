@@ -281,8 +281,13 @@ export default function App() {
     } catch (reason) {
       const detail = String(reason);
       if (manual) {
+        const releaseNotReady = detail.includes("404")
+          || detail.includes("valid release JSON")
+          || detail.includes("from the remote");
         setUpdatePhase("error");
-        setUpdateMessage(detail.includes("404") ? "目前还没有发布可用更新" : `检查更新失败：${detail}`);
+        setUpdateMessage(releaseNotReady
+          ? "更新服务正在准备首个版本，请稍后再试"
+          : "暂时无法连接更新服务，请检查网络后重试");
         setShowUpdate(true);
       } else {
         setUpdatePhase("idle");
