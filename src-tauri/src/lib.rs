@@ -103,6 +103,22 @@ struct AssessmentResult {
     level_hint: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuizAnswer {
+    question_id: String,
+    chosen_index: usize,
+    correct: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArticleQuizState {
+    completed: bool,
+    answers: Vec<QuizAnswer>,
+    feedback: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WeeklyAssessment {
@@ -390,6 +406,17 @@ fn open_db(state: &AppState) -> Result<Connection, AppError> {
         generated_at TEXT NOT NULL
       );
     ",
+    )?;
+    conn.execute(
+        "DELETE FROM answers WHERE rowid NOT IN (
+           SELECT MAX(rowid) FROM answers GROUP BY article_id, question_id
+         )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS answers_article_question_unique
+         ON answers(article_id, question_id)",
+        [],
     )?;
     let image_column_exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('articles') WHERE name = 'images_json'",
@@ -2136,7 +2163,7 @@ async fn get_questions(
     };
     let questions = match generate_questions(article.clone(), learned_expressions, question_brief).await {
         Ok(questions) => questions,
-        Err(_) => return Ok(fallback_questions(&article)),
+        Err(_) => fallback_questions(&article),
     };
     let conn = open_db(&state)?;
     conn.execute(
@@ -2144,6 +2171,46 @@ async fn get_questions(
     params![article.id, serde_json::to_string(&questions).map_err(|error| AppError::Message(format!("理解题保存失败：{error}")))?, Local::now().to_rfc3339()]
   )?;
     Ok(questions)
+}
+
+#[tauri::command]
+fn get_article_quiz_state(
+    state: State<'_, AppState>,
+    article_id: String,
+) -> Result<ArticleQuizState, AppError> {
+    let conn = open_db(&state)?;
+    let completed = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM articles WHERE id = ?1 AND completed_at IS NOT NULL)",
+        params![article_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let mut statement = conn.prepare(
+        "SELECT question_id, chosen_index, correct FROM answers
+         WHERE article_id = ?1 ORDER BY rowid ASC",
+    )?;
+    let mut latest = std::collections::HashMap::<String, QuizAnswer>::new();
+    for answer in statement.query_map(params![article_id], |row| {
+        Ok(QuizAnswer {
+            question_id: row.get(0)?,
+            chosen_index: row.get::<_, i64>(1)? as usize,
+            correct: row.get(2)?,
+        })
+    })? {
+        let answer = answer?;
+        latest.insert(answer.question_id.clone(), answer);
+    }
+    let feedback = conn
+        .query_row(
+            "SELECT label FROM topic_feedback WHERE article_id = ?1 ORDER BY rowid DESC LIMIT 1",
+            params![article_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(ArticleQuizState {
+        completed,
+        answers: latest.into_values().collect(),
+        feedback,
+    })
 }
 
 fn fallback_questions(article: &Article) -> Vec<Question> {
@@ -2316,7 +2383,11 @@ fn record_answer(
     let conn = open_db(&state)?;
     conn.execute(
         "INSERT INTO answers (id, article_id, question_id, chosen_index, correct, created_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(article_id, question_id) DO UPDATE SET
+           chosen_index = excluded.chosen_index,
+           correct = excluded.correct,
+           created_at = excluded.created_at",
         params![
             Uuid::new_v4().to_string(),
             article_id,
@@ -2645,6 +2716,7 @@ pub fn run() {
             discover_models,
             save_openai_api_key,
             get_questions,
+            get_article_quiz_state,
             record_answer,
             complete_article,
             save_topic_feedback,

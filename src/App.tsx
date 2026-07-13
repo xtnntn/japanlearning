@@ -197,7 +197,7 @@ export default function App() {
   const [explanationError, setExplanationError] = useState<string>();
   const [questions, setQuestions] = useState<Question[]>([]);
   const [questionIndex, setQuestionIndex] = useState(0);
-  const [answerState, setAnswerState] = useState<{ chosen: number; correct: boolean }>();
+  const [questionAnswers, setQuestionAnswers] = useState<Record<string, { chosen: number; correct: boolean }>>({});
   const [completed, setCompleted] = useState(false);
   const [generatingQuestions, setGeneratingQuestions] = useState(false);
   const [quizError, setQuizError] = useState<string>();
@@ -255,6 +255,7 @@ export default function App() {
   const selectionRequestSequenceRef = useRef(0);
 
   const currentQuestion = questions[questionIndex];
+  const answerState = currentQuestion ? questionAnswers[currentQuestion.id] : undefined;
   const deckCard = reviewCards[deckIndex];
   const selectionRateHint = useMemo(() => {
     if (!progress || !article) return "正在建立基线";
@@ -334,6 +335,20 @@ export default function App() {
         setReminder(reminderStatus);
         setReviewCard(dueCard);
         setReminderTime(`${String(reminderStatus.hour).padStart(2, "0")}:${String(reminderStatus.minute).padStart(2, "0")}`);
+        void api.getArticleQuizState(nextArticle.id).then(async (quizState) => {
+          if (!quizState.completed) return;
+          const savedQuestions = await api.getQuestions(nextArticle);
+          const savedAnswers = Object.fromEntries(quizState.answers.map((answer) => [
+            answer.questionId,
+            { chosen: answer.chosenIndex, correct: answer.correct },
+          ]));
+          const firstUnanswered = savedQuestions.findIndex((question) => !savedAnswers[question.id]);
+          setQuestions(savedQuestions);
+          setQuestionAnswers(savedAnswers);
+          setQuestionIndex(firstUnanswered >= 0 ? firstUnanswered : Math.max(0, savedQuestions.length - 1));
+          setFeedback(quizState.feedback);
+          setCompleted(true);
+        }).catch((reason: unknown) => setQuizError(String(reason)));
         if (nextProgress.titleVotes === 0) {
           void api.getTitleCandidates().then((items) => {
             setCandidates(items);
@@ -437,7 +452,7 @@ export default function App() {
       setExplanationError(undefined);
       setQuestions([]);
       setQuestionIndex(0);
-      setAnswerState(undefined);
+      setQuestionAnswers({});
       setFeedback(undefined);
       window.scrollTo({ top: 0, behavior: "smooth" });
       void api.getProgress().then(setProgress);
@@ -480,13 +495,12 @@ export default function App() {
   const answerQuestion = async (index: number) => {
     if (!article || !currentQuestion || answerState) return;
     const correct = await api.recordAnswer(article.id, currentQuestion.id, index, currentQuestion.answerIndex, currentQuestion.testedExpressions);
-    setAnswerState({ chosen: index, correct });
+    setQuestionAnswers((answers) => ({ ...answers, [currentQuestion.id]: { chosen: index, correct } }));
   };
 
   const nextQuestion = () => {
     if (questionIndex + 1 < questions.length) {
       setQuestionIndex((index) => index + 1);
-      setAnswerState(undefined);
     }
   };
 

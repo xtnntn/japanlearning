@@ -33,6 +33,9 @@ export type Question = {
   testedExpressions: string[];
 };
 
+export type QuizAnswer = { questionId: string; chosenIndex: number; correct: boolean };
+export type ArticleQuizState = { completed: boolean; answers: QuizAnswer[]; feedback?: string };
+
 export type Progress = {
   selectedCount: number;
   chineseReveals: number;
@@ -68,6 +71,7 @@ export const api = {
   getReviewCards: () => invoke<ReviewCard[]>("get_review_cards"),
   reviewCard: (cardId: string, remembered: boolean) => invoke<ReviewCard | null>("review_card", { cardId, remembered }),
   getQuestions: (article: Article) => invoke<Question[]>("get_questions", { article }),
+  getArticleQuizState: (articleId: string) => invoke<ArticleQuizState>("get_article_quiz_state", { articleId }),
   recordAnswer: (articleId: string, questionId: string, chosenIndex: number, answerIndex: number, testedExpressions: string[]) =>
     invoke<boolean>("record_answer", { articleId, questionId, chosenIndex, answerIndex, testedExpressions }),
   completeArticle: (articleId: string) => invoke<void>("complete_article", { articleId }),
