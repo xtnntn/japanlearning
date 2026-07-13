@@ -62,7 +62,7 @@ npm run tauri dev
 
 应用右上角点击“AI 设置”，输入兼容服务的 Base URL 和 API Key，检测服务实际提供的模型，选择后保存。
 
-Base URL、调用协议、模型与 Key 会进入 macOS Keychain。选择 `Responses` 时调用 `/responses`；选择 `Chat Completions` 时调用 `/chat/completions`。前端不会回显已保存的 Key；修改 Base URL、协议或模型时可以留空复用现有 Key。不要将 Key 写入 `.env`、源码、SQLite 或 Git 提交。
+Base URL、调用协议、模型与 Key 会保存在本机应用设置目录，设置文件权限限制为当前用户读写，不再访问 macOS Keychain。选择 `Responses` 时调用 `/responses`；选择 `Chat Completions` 时调用 `/chat/completions`。前端不会回显已保存的 Key；修改 Base URL、协议或模型时可以留空复用现有 Key。不要将 Key 写入 `.env`、源码、SQLite 或 Git 提交。
 
 每日提醒也在“AI 设置”中配置。只有点击“启用提醒”后，应用才会写入用户级 `launchd` 配置；关闭提醒会移除该配置。
 
@@ -84,10 +84,28 @@ src-tauri/target/release/bundle/dmg/Kotoba Atelier_0.1.0_aarch64.dmg
 当前两周试验包 SHA-256：
 
 ```text
-9994ac5f48686e21fe2acdf32e7b49df2c59e912762ff7e2e37b2662c157c87fbf
+1c8c5ba9b2f1c04b42c9888d78378f4eb7984ac171fa3946daa84474e6a6af24
 ```
 
 当前配置使用完整的本地 ad-hoc 签名，适合开发者本人安装和更新。它没有 Apple Developer ID 公证；若未来对外分发，需要配置正式证书并完成 notarization。
+
+## 应用内更新
+
+Kotoba Atelier 启动后会静默检查 GitHub Release。发现新版本时，左侧导航底部会出现提示；打开后可查看版本说明、下载进度，并在安装完成后自动重启。也可以点击左侧的版本号手动检查。
+
+发布新版本：
+
+```bash
+npm run release:version -- 0.2.0
+npm run build
+(cd src-tauri && cargo check)
+git add .
+git commit -m "release: v0.2.0"
+git tag v0.2.0
+git push origin main --tags
+```
+
+`v*` 标签会触发 [GitHub Actions](.github/workflows/release.yml)，自动构建 macOS 安装包、签名更新归档并发布 `latest.json`。更新签名私钥只保存在本机 `~/.config/kotoba-atelier/updater.key` 和 GitHub Actions Secret `TAURI_SIGNING_PRIVATE_KEY` 中；私钥丢失后，已安装版本将无法信任使用新密钥签出的更新。
 
 ## 验证命令
 

@@ -1,4 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { getVersion } from "@tauri-apps/api/app";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import { api, type AbilityProfile, type AiStatus, type Article, type AssessmentQuestion, type AssessmentResult, type Explanation, type MultiAgentPlan, type Progress, type Question, type ReminderStatus, type ReviewCard, type TitleCandidate, type WeeklyAssessment } from "./api";
 
 const feedbackOptions = [
@@ -135,7 +138,7 @@ function Modal({
   );
 }
 
-function MenuIcon({ name }: { name: "ai" | "weekly" | "deck" | "progress" | "profile" | "refresh" }) {
+function MenuIcon({ name }: { name: "ai" | "weekly" | "deck" | "progress" | "profile" | "refresh" | "update" }) {
   const icons: Record<string, ReactNode> = {
     ai: (
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -169,6 +172,12 @@ function MenuIcon({ name }: { name: "ai" | "weekly" | "deck" | "progress" | "pro
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
         <path d="M21 12a9 9 0 1 1-2.64-6.36" />
         <path d="M21 3v9h-9" />
+      </svg>
+    ),
+    update: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M12 3v12M7 10l5 5 5-5" />
+        <path d="M5 20h14" />
       </svg>
     ),
   };
@@ -232,6 +241,12 @@ export default function App() {
   const [reviewRevealed, setReviewRevealed] = useState(false);
   const [reviewingCard, setReviewingCard] = useState(false);
   const [inlineReviewDismissed, setInlineReviewDismissed] = useState(false);
+  const [currentVersion, setCurrentVersion] = useState("0.1.0");
+  const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
+  const [showUpdate, setShowUpdate] = useState(false);
+  const [updatePhase, setUpdatePhase] = useState<"idle" | "checking" | "available" | "downloading" | "latest" | "error">("idle");
+  const [updateProgress, setUpdateProgress] = useState(0);
+  const [updateMessage, setUpdateMessage] = useState("");
   const readerRef = useRef<HTMLElement>(null);
   const selectionPopoverRef = useRef<HTMLElement>(null);
   const finishRef = useRef<HTMLDivElement>(null);
@@ -245,6 +260,61 @@ export default function App() {
     if (!progress || !article) return "正在建立基线";
     return `标记 ${progress.selectedCount} 处 · 中文辅助 ${progress.chineseReveals} 次`;
   }, [progress, article]);
+
+  const checkForUpdates = async (manual = false) => {
+    if (updatePhase === "checking" || updatePhase === "downloading") return;
+    setUpdatePhase("checking");
+    setUpdateMessage(manual ? "正在连接更新服务…" : "");
+    try {
+      const update = await check();
+      if (update) {
+        setAvailableUpdate(update);
+        setUpdatePhase("available");
+        setUpdateMessage(`新版本 ${update.version} 已准备好`);
+        setShowUpdate(true);
+      } else {
+        setAvailableUpdate(null);
+        setUpdatePhase("latest");
+        setUpdateMessage("当前已经是最新版本");
+        if (manual) setShowUpdate(true);
+      }
+    } catch (reason) {
+      const detail = String(reason);
+      if (manual) {
+        setUpdatePhase("error");
+        setUpdateMessage(detail.includes("404") ? "目前还没有发布可用更新" : `检查更新失败：${detail}`);
+        setShowUpdate(true);
+      } else {
+        setUpdatePhase("idle");
+      }
+    }
+  };
+
+  const installAvailableUpdate = async () => {
+    if (!availableUpdate || updatePhase === "downloading") return;
+    setUpdatePhase("downloading");
+    setUpdateProgress(0);
+    setUpdateMessage("正在下载更新…");
+    let downloaded = 0;
+    let total = 0;
+    try {
+      await availableUpdate.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength ?? 0;
+        } else if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          if (total > 0) setUpdateProgress(Math.min(100, Math.round(downloaded / total * 100)));
+        } else if (event.event === "Finished") {
+          setUpdateProgress(100);
+          setUpdateMessage("安装完成，正在重新启动…");
+        }
+      });
+      await relaunch();
+    } catch (reason) {
+      setUpdatePhase("error");
+      setUpdateMessage(`更新安装失败：${String(reason)}`);
+    }
+  };
 
   useEffect(() => {
     void Promise.all([api.getTodayArticle(), api.getProgress(), api.getAiStatus(), api.getReminderStatus(), api.getDueReviewCard()])
@@ -273,6 +343,12 @@ export default function App() {
       })
       .catch((reason: unknown) => setError(String(reason)))
       .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    void getVersion().then(setCurrentVersion).catch(() => {});
+    const timer = window.setTimeout(() => { void checkForUpdates(false); }, 2500);
+    return () => window.clearTimeout(timer);
   }, []);
 
   useEffect(() => {
@@ -722,6 +798,19 @@ export default function App() {
             <span>{refreshingDaily ? "正在选文…" : "重新选文"}</span>
           </button>
         </div>
+        <div className="side-update">
+          <button
+            className={`menu-button update-button phase-${updatePhase}`}
+            onClick={() => updatePhase === "available" ? setShowUpdate(true) : void checkForUpdates(true)}
+            title={updatePhase === "available" ? `可更新至 ${availableUpdate?.version}` : "检查更新"}
+            aria-label={updatePhase === "available" ? `可更新至 ${availableUpdate?.version}` : "检查更新"}
+            type="button"
+          >
+            <MenuIcon name="update" />
+            <span>{updatePhase === "available" ? `更新 ${availableUpdate?.version}` : updatePhase === "checking" ? "检查中…" : `版本 ${currentVersion}`}</span>
+            {updatePhase === "available" && <b aria-hidden="true" />}
+          </button>
+        </div>
       </nav>
 
       {dailyRefreshMessage && <p className="daily-refresh-message">{dailyRefreshMessage}</p>}
@@ -986,6 +1075,28 @@ export default function App() {
             </div>
           )}
         </div>
+      </Modal>
+
+      <Modal open={showUpdate} onClose={() => { if (updatePhase !== "downloading") setShowUpdate(false); }} titleId="update-title" size="md" className="update-modal">
+        <p className="eyebrow">KOTOBA ATELIER · UPDATE</p>
+        <h3 id="update-title">
+          {updatePhase === "available" || updatePhase === "downloading" ? `新版本 ${availableUpdate?.version ?? ""}` : "软件更新"}
+        </h3>
+        {updatePhase === "checking" && <div className="update-checking"><span className="spinner" /><p>正在检查更新…</p></div>}
+        {updatePhase === "latest" && <div className="update-result"><strong>已经是最新版本</strong><p>当前版本 {currentVersion}</p></div>}
+        {updatePhase === "error" && <div className="update-result update-error"><strong>暂时无法更新</strong><p>{updateMessage}</p></div>}
+        {(updatePhase === "available" || updatePhase === "downloading") && availableUpdate && (
+          <>
+            <div className="update-version-row"><span>当前版本 {currentVersion}</span><i>→</i><strong>{availableUpdate.version}</strong></div>
+            {availableUpdate.body && <div className="update-notes"><span>更新内容</span><p>{availableUpdate.body}</p></div>}
+            {updatePhase === "downloading" && <div className="update-download"><div><span>正在下载并验证更新</span><strong>{updateProgress}%</strong></div><div className="update-progress-track"><i style={{ width: `${updateProgress}%` }} /></div><small>{updateMessage}</small></div>}
+            <div className="update-actions">
+              <Button variant="secondary" disabled={updatePhase === "downloading"} onClick={() => setShowUpdate(false)}>稍后更新</Button>
+              <Button variant="primary" disabled={updatePhase === "downloading"} onClick={() => void installAvailableUpdate()}>{updatePhase === "downloading" ? "正在安装…" : "立即更新并重启"}</Button>
+            </div>
+          </>
+        )}
+        {(updatePhase === "latest" || updatePhase === "error") && <div className="update-actions"><Button variant="secondary" onClick={() => setShowUpdate(false)}>关闭</Button><Button variant="primary" onClick={() => void checkForUpdates(true)}>重新检查</Button></div>}
       </Modal>
 
       <Modal open={showSettings} onClose={() => setShowSettings(false)} titleId="ai-settings-title" size="lg">
