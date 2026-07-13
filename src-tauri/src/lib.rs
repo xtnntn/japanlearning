@@ -123,7 +123,7 @@ struct Explanation {
     example: String,
     example_translation: String,
     grammar_note: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_review_candidates")]
     review_candidates: Vec<ReviewCardDraft>,
 }
 
@@ -134,6 +134,18 @@ struct ReviewCardDraft {
     reading: String,
     translation: String,
     context_note: String,
+}
+
+fn deserialize_review_candidates<'de, D>(deserializer: D) -> Result<Vec<ReviewCardDraft>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<serde_json::Value>::deserialize(deserializer).unwrap_or_default();
+    Ok(values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<ReviewCardDraft>(value).ok())
+        .take(2)
+        .collect())
 }
 
 #[derive(Debug, Serialize)]
@@ -665,6 +677,40 @@ fn remember_json_schema_capability(value: bool) {
     }
 }
 
+fn chat_content_text(content: &serde_json::Value) -> Option<String> {
+    if let Some(text) = content.as_str() {
+        return Some(text.to_owned());
+    }
+    content.as_array().map(|parts| {
+        parts.iter().filter_map(|part| {
+            part.get("text").and_then(|value| value.as_str())
+                .or_else(|| part.get("content").and_then(|value| value.as_str()))
+        }).collect::<Vec<_>>().join("")
+    }).filter(|text| !text.is_empty())
+}
+
+fn responses_content_text(body: &serde_json::Value) -> Option<String> {
+    body.get("output_text").and_then(|value| value.as_str()).map(str::to_owned).or_else(|| {
+        body.get("output").and_then(|value| value.as_array()).map(|items| {
+            items.iter().flat_map(|item| item.get("content").and_then(|value| value.as_array()).into_iter().flatten())
+                .filter_map(|part| part.get("text").and_then(|value| value.as_str()))
+                .collect::<Vec<_>>().join("")
+        }).filter(|text| !text.is_empty())
+    })
+}
+
+fn parse_json_value(output: &str) -> Result<serde_json::Value, String> {
+    let cleaned = output.trim()
+        .trim_start_matches("```json").trim_start_matches("```")
+        .trim_end_matches("```").trim();
+    if let Ok(value) = serde_json::from_str(cleaned) {
+        return Ok(value);
+    }
+    let start = cleaned.find('{').ok_or_else(|| "没有找到 JSON 对象起点".to_string())?;
+    let end = cleaned.rfind('}').ok_or_else(|| "没有找到 JSON 对象终点".to_string())?;
+    serde_json::from_str(&cleaned[start..=end]).map_err(|error| error.to_string())
+}
+
 async fn generate_structured<T: for<'de> Deserialize<'de>>(
     api_key: &str,
     system: &str,
@@ -674,8 +720,8 @@ async fn generate_structured<T: for<'de> Deserialize<'de>>(
 ) -> Result<T, AppError> {
     let client = api_http_client()?;
     let protocol = get_protocol();
-    let mut last_empty_response = false;
-    for attempt in 0..2 {
+    let mut last_error = String::new();
+    for attempt in 0..3 {
         let output = if protocol == "chat_completions" {
             let endpoint = chat_completions_url(&get_base_url())?;
             let chat_system = format!(
@@ -683,7 +729,7 @@ async fn generate_structured<T: for<'de> Deserialize<'de>>(
             );
             let mut payload = serde_json::json!({
               "model": get_model(),
-              "max_tokens": 480,
+              "max_tokens": match schema_name { "selection_explanation" => 900, "reading_questions" => 2400, _ => 1200 },
               "messages": [
                 { "role": "system", "content": chat_system },
                 { "role": "user", "content": user }
@@ -704,9 +750,6 @@ async fn generate_structured<T: for<'de> Deserialize<'de>>(
                 .json(&payload)
                 .send()
                 .await?;
-            if use_json_schema && response.status().is_success() {
-                remember_json_schema_capability(true);
-            }
             if use_json_schema
                 && !response.status().is_success()
                 && matches!(response.status().as_u16(), 400 | 422)
@@ -745,8 +788,7 @@ async fn generate_structured<T: for<'de> Deserialize<'de>>(
                 .and_then(|choices| choices.first())
                 .and_then(|choice| choice.get("message"))
                 .and_then(|message| message.get("content"))
-                .and_then(|content| content.as_str())
-                .map(str::to_owned)
+                .and_then(chat_content_text)
                 .ok_or_else(|| {
                     AppError::Message("Chat Completions 未返回 choices[0].message.content".into())
                 })?
@@ -764,7 +806,7 @@ async fn generate_structured<T: for<'de> Deserialize<'de>>(
                 "type": "json_schema",
                 "name": schema_name,
                 "strict": true,
-                "schema": schema
+                "schema": schema.clone()
               }
             }
             });
@@ -783,37 +825,27 @@ async fn generate_structured<T: for<'de> Deserialize<'de>>(
                 )));
             }
             let body: serde_json::Value = response.json().await?;
-            body.get("output_text")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned)
+            responses_content_text(&body)
                 .ok_or_else(|| AppError::Message("Responses 未返回 output_text".into()))?
         };
-        let output = output
-            .trim()
-            .trim_start_matches("```json")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim();
+        let output = output.trim();
         if output.is_empty() {
             remember_json_schema_capability(false);
-            if attempt == 0 {
-                last_empty_response = true;
-                continue;
-            }
-            return Err(AppError::Message(
-                "AI 服务暂时没有返回内容，请稍后重新划选。".into(),
-            ));
+            last_error = "AI 返回空内容".into();
+            continue;
         }
-        match serde_json::from_str(output) {
-            Ok(value) => return Ok(value),
-            Err(error) => return Err(AppError::Message(format!("AI 返回 JSON 无效：{error}"))),
+        match parse_json_value(output).and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string())) {
+            Ok(value) => {
+                if protocol == "chat_completions" { remember_json_schema_capability(true); }
+                return Ok(value);
+            }
+            Err(error) => {
+                remember_json_schema_capability(false);
+                last_error = error;
+            }
         }
     }
-    Err(AppError::Message(if last_empty_response {
-        "AI 返回了空内容，已自动重试一次仍未成功。请稍后重新划选。".into()
-    } else {
-        "AI 返回内容无效。请稍后重新划选。".into()
-    }))
+    Err(AppError::Message(format!("AI 返回格式异常，已自动兼容并重试：{last_error}")))
 }
 
 fn explanation_schema() -> serde_json::Value {
@@ -1753,6 +1785,69 @@ fn save_review_cards(conn: &Connection, selection_id: &str, article_id: &str, ca
     Ok(())
 }
 
+fn extract_plain_section(text: &str, labels: &[&str], all_labels: &[&str]) -> Option<String> {
+    let (start, label_len) = labels.iter().filter_map(|label| text.find(label).map(|index| (index, label.len())))
+        .min_by_key(|(index, _)| *index)?;
+    let content_start = start + label_len;
+    let end = all_labels.iter().filter_map(|label| text[content_start..].find(label).map(|index| content_start + index))
+        .min().unwrap_or(text.len());
+    let value = text[content_start..end].trim().trim_start_matches(['：', ':', ' ']).trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn explanation_from_plain_text(selection: &str, text: &str) -> Explanation {
+    let reading_labels = ["[READING]", "【读音】", "读音：", "读音", "読み：", "読み"];
+    let translation_labels = ["[TRANSLATION]", "【译文】", "译文：", "译文", "意思：", "意思"];
+    let context_labels = ["[CONTEXT]", "【语境】", "语境：", "语境"];
+    let all_labels = reading_labels.iter().chain(translation_labels.iter()).chain(context_labels.iter()).copied().collect::<Vec<_>>();
+    let reading = extract_plain_section(text, &reading_labels, &all_labels).unwrap_or_else(|| selection.to_owned());
+    let translation = extract_plain_section(text, &translation_labels, &all_labels).unwrap_or_else(|| text.trim().to_owned());
+    let context_note = extract_plain_section(text, &context_labels, &all_labels).unwrap_or_default();
+    Explanation {
+        reading, translation, context_note,
+        example: String::new(), example_translation: String::new(), grammar_note: String::new(), review_candidates: vec![],
+    }
+}
+
+async fn generate_plain_explanation(api_key: &str, selection: &str, context: &str) -> Result<Explanation, AppError> {
+    let instruction = format!(
+        "请解释日语表达「{selection}」在指定语境中的意思。不要返回 JSON，只按以下三段输出，不得添加其他标题：\n[READING] 整个划选表达的纯假名读音\n[TRANSLATION] 结合上下文的简洁中文译文\n[CONTEXT] 必要时补一句中文语境提示，不需要则留空\n指定语境：{context}"
+    );
+    let client = api_http_client()?;
+    let body: serde_json::Value = if get_protocol() == "chat_completions" {
+        let response = client.post(chat_completions_url(&get_base_url())?)
+            .bearer_auth(api_key)
+            .json(&serde_json::json!({
+                "model": get_model(), "max_tokens": 600,
+                "messages": [{ "role": "user", "content": instruction }]
+            })).send().await?;
+        if !response.status().is_success() {
+            return Err(AppError::Message(format!("纯文本解释请求失败：{}", response.status())));
+        }
+        response.json().await?
+    } else {
+        let response = client.post(responses_url(&get_base_url())?)
+            .bearer_auth(api_key)
+            .json(&serde_json::json!({
+                "model": get_model(),
+                "input": [{ "role": "user", "content": [{ "type": "input_text", "text": instruction }] }]
+            })).send().await?;
+        if !response.status().is_success() {
+            return Err(AppError::Message(format!("纯文本解释请求失败：{}", response.status())));
+        }
+        response.json().await?
+    };
+    let text = if get_protocol() == "chat_completions" {
+        body.get("choices").and_then(|value| value.as_array()).and_then(|value| value.first())
+            .and_then(|value| value.get("message")).and_then(|value| value.get("content"))
+            .and_then(chat_content_text)
+    } else {
+        responses_content_text(&body)
+    }.filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| AppError::Message("AI 纯文本解释也返回了空内容".into()))?;
+    Ok(explanation_from_plain_text(selection, &text))
+}
+
 #[tauri::command]
 fn get_due_review_card(state: State<'_, AppState>) -> Result<Option<ReviewCard>, AppError> {
     let conn = open_db(&state)?;
@@ -1819,14 +1914,17 @@ async fn explain_selection(
     let explanation = if let Some(api_key) = get_api_key() {
         let system = "你是面向中国母语者的日语阅读教练。用户划选了真实日文文章中的一段。不要输出日语释义。translation、contextNote、exampleTranslation、grammarNote 必须用简洁中文。reading 必须完整复现用户划选文本，并为其中每个汉字词补括号假名，例如「文化祭（ぶんかさい）のような」；绝不使用罗马音。translation 必须结合完整上下文。为提高即时反馈速度：translation 最多 28 个汉字，contextNote 最多 35 个汉字；example 最多 40 个日文字符，exampleTranslation 最多 30 个汉字；grammarNote 最多 35 个汉字。没有必要的例句或语法时，对应字段返回空字符串。不要编造原文事实。reviewCandidates 是给间隔复习用的候选卡：只保留可复用、存在学习价值的核心词、短语或语法搭配；整句、专有名词、过于简单的词、与已有卡重复或语义近重复时返回空数组。必要时把用户的长划选拆成最多两张独立的短表达卡；front 必须是原文中连续出现的日语表达。";
         let user = format!("划选文本：{selection}\n完整所在句/上下文：{context}\n已有卡正面（避免重复）：{}", if existing_cards.is_empty() { "暂无".into() } else { existing_cards.join("、") });
-        generate_structured(
+        match generate_structured(
             &api_key,
             system,
             &user,
             "selection_explanation",
             explanation_schema(),
         )
-        .await?
+        .await {
+            Ok(explanation) => explanation,
+            Err(_) => generate_plain_explanation(&api_key, selection, &context).await?,
+        }
     } else {
         Explanation {
             reading: format!("{selection}（需要配置 AI 才能生成准确假名读音）"),
@@ -2567,6 +2665,60 @@ mod tests {
             responses_url("https://api.example.com/v1").unwrap(),
             "https://api.example.com/v1/responses"
         );
+    }
+
+    #[test]
+    fn malformed_anki_candidates_do_not_break_translation() {
+        let explanation: Explanation = serde_json::from_value(serde_json::json!({
+            "reading": "ハック（はっく）", "translation": "改造、突破既有方式", "contextNote": "此处是比喻用法",
+            "example": "街をハックする。", "exampleTranslation": "重新改造城市。", "grammarNote": "サ变动词",
+            "reviewCandidates": ["ハッカー", "ハッキング"]
+        })).unwrap();
+        assert_eq!(explanation.translation, "改造、突破既有方式");
+        assert!(explanation.review_candidates.is_empty());
+    }
+
+    #[test]
+    fn json_parser_accepts_fences_and_leading_text() {
+        let value = parse_json_value("回答如下：\n```json\n{\"translation\":\"测试\"}\n```").unwrap();
+        assert_eq!(value["translation"], "测试");
+    }
+
+    #[test]
+    fn plain_fallback_separates_kana_translation_and_context() {
+        let explanation = explanation_from_plain_text(
+            "見放題最速配信スタートする",
+            "读音 みほうだい さいそく はいしん スタートする\n译文 从7月7日起开始最快不限次数播放。\n语境 宣传流媒体上线时间。",
+        );
+        assert!(explanation.reading.starts_with("みほうだい"));
+        assert!(explanation.translation.starts_with("从7月7日"));
+        assert_eq!(explanation.context_note, "宣传流媒体上线时间。");
+        assert!(!explanation.context_note.contains("Schema"));
+    }
+
+    #[test]
+    #[ignore = "requires the locally configured AI gateway"]
+    fn live_configured_gateway_returns_usable_explanation() {
+        tauri::async_runtime::block_on(async {
+            let api_key = get_api_key().expect("local API key must be configured");
+            let explanation: Explanation = generate_structured(
+                &api_key,
+                "你是日语阅读教练。返回简洁中文解释。reading、translation、contextNote、example、exampleTranslation、grammarNote 必须是字符串；reviewCandidates 必须是数组，不确定时返回空数组。",
+                "划选文本：ハック\n上下文：渋谷の街をハックする。",
+                "selection_explanation",
+                explanation_schema(),
+            ).await.unwrap();
+            assert!(!explanation.translation.trim().is_empty());
+            assert!(!explanation.reading.trim().is_empty());
+            let fallback = generate_plain_explanation(
+                &api_key,
+                "見放題最速配信スタートする",
+                "7月7日からAmazonのPrime Videoで見放題最速配信スタートする。",
+            ).await.unwrap();
+            assert_ne!(fallback.reading, "見放題最速配信スタートする");
+            assert!(!fallback.translation.contains("[READING]"));
+            assert!(!fallback.context_note.contains("Schema"));
+        });
     }
 
     #[test]
