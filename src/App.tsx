@@ -190,6 +190,7 @@ export default function App() {
   const [questionIndex, setQuestionIndex] = useState(0);
   const [answerState, setAnswerState] = useState<{ chosen: number; correct: boolean }>();
   const [completed, setCompleted] = useState(false);
+  const [generatingQuestions, setGeneratingQuestions] = useState(false);
   const [quizError, setQuizError] = useState<string>();
   const [feedback, setFeedback] = useState<string>();
   const [showSettings, setShowSettings] = useState(false);
@@ -369,6 +370,7 @@ export default function App() {
   const finishReading = async () => {
     if (!article || completed || generatingQuestionsRef.current) return;
     generatingQuestionsRef.current = true;
+    setGeneratingQuestions(true);
     setQuizError(undefined);
     try {
       await api.completeArticle(article.id);
@@ -380,6 +382,7 @@ export default function App() {
       setQuizError(String(reason));
     } finally {
       generatingQuestionsRef.current = false;
+      setGeneratingQuestions(false);
     }
   };
 
@@ -798,12 +801,21 @@ export default function App() {
             </section>
           )}
           <div className="finish-zone" ref={finishRef}>
-            <p className={quizError ? "error-text" : undefined}>
-              {completed ? "已到达文末，理解题已出现。" : quizError ? `理解题准备失败：${quizError}` : "到达这里会自动准备理解题。"}
-            </p>
-            {!completed && (
+            {generatingQuestions ? (
+              <div className="quiz-loading-feedback" role="status" aria-live="polite">
+                <div className="quiz-loader" aria-hidden="true"><i /><i /><i /></div>
+                <strong>AI 正在准备理解题</strong>
+                <span>核对原文证据 · 调整选项难度 · 生成中文解析</span>
+                <div className="quiz-loading-track" aria-hidden="true"><b /></div>
+              </div>
+            ) : (
+              <p className={quizError ? "error-text" : undefined}>
+                {completed ? "已到达文末，理解题已出现。" : quizError ? `理解题准备失败：${quizError}` : "到达这里会自动准备理解题。"}
+              </p>
+            )}
+            {!completed && !generatingQuestions && (
               <Button variant="primary" onClick={() => void finishReading()}>
-                没有自动出现？点击重试
+                {quizError ? "重新生成理解题" : "没有自动出现？点击重试"}
               </Button>
             )}
           </div>

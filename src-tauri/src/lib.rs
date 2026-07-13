@@ -160,6 +160,7 @@ struct AiStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Question {
+    #[serde(default)]
     id: String,
     prompt: String,
     choices: Vec<String>,
@@ -739,11 +740,13 @@ async fn generate_structured<T: for<'de> Deserialize<'de>>(
             // OpenAI-compatible routers. The second attempt deliberately avoids strict
             // schema mode instead of repeating the exact same request.
             let use_json_schema = attempt == 0 && cached_json_schema_capability().unwrap_or(true);
-            payload["response_format"] = if use_json_schema {
-                serde_json::json!({ "type": "json_schema", "json_schema": { "name": schema_name, "strict": true, "schema": schema.clone() } })
-            } else {
-                serde_json::json!({ "type": "json_object" })
-            };
+            if attempt < 2 {
+                payload["response_format"] = if use_json_schema {
+                    serde_json::json!({ "type": "json_schema", "json_schema": { "name": schema_name, "strict": true, "schema": schema.clone() } })
+                } else {
+                    serde_json::json!({ "type": "json_object" })
+                };
+            }
             let mut response = client
                 .post(&endpoint)
                 .bearer_auth(api_key)
@@ -787,8 +790,10 @@ async fn generate_structured<T: for<'de> Deserialize<'de>>(
                 .and_then(|choices| choices.as_array())
                 .and_then(|choices| choices.first())
                 .and_then(|choice| choice.get("message"))
-                .and_then(|message| message.get("content"))
-                .and_then(chat_content_text)
+                .and_then(|message| {
+                    message.get("content").and_then(chat_content_text)
+                        .or_else(|| message.get("reasoning_content").and_then(chat_content_text))
+                })
                 .ok_or_else(|| {
                     AppError::Message("Chat Completions 未返回 choices[0].message.content".into())
                 })?
@@ -886,12 +891,20 @@ fn question_schema() -> serde_json::Value {
               "explanation": { "type": "string" }
               ,"testedExpressions": { "type": "array", "maxItems": 3, "items": { "type": "string" } }
             },
-            "required": ["id", "prompt", "choices", "answerIndex", "evidence", "explanation", "testedExpressions"]
+            "required": ["prompt", "choices", "answerIndex", "evidence", "explanation", "testedExpressions"]
           }
         }
       },
       "required": ["questions"]
     })
+}
+
+fn ensure_question_ids(questions: &mut [Question]) {
+    for (index, question) in questions.iter_mut().enumerate() {
+        if question.id.trim().is_empty() {
+            question.id = format!("ai-question-{}-{}", index + 1, Uuid::new_v4());
+        }
+    }
 }
 
 fn multi_agent_plan_schema() -> serde_json::Value {
@@ -2050,7 +2063,7 @@ async fn generate_questions(
             serde_json::to_string(&learned_expressions).unwrap_or_else(|_| "[]".into()),
             article.paragraphs.join("\n\n")
         );
-        let result: QuestionSet = generate_structured(
+        let mut result: QuestionSet = generate_structured(
             &api_key,
             system,
             &user,
@@ -2058,6 +2071,7 @@ async fn generate_questions(
             question_schema(),
         )
         .await?;
+        ensure_question_ids(&mut result.questions);
         if result.questions.iter().all(|question| {
             article
                 .paragraphs
@@ -2120,8 +2134,10 @@ async fn get_questions(
         let conn = open_db(&state)?;
         multi_agent_plan(&conn).map(|plan| plan.question_brief)
     };
-    let questions =
-        generate_questions(article.clone(), learned_expressions, question_brief).await?;
+    let questions = match generate_questions(article.clone(), learned_expressions, question_brief).await {
+        Ok(questions) => questions,
+        Err(_) => return Ok(fallback_questions(&article)),
+    };
     let conn = open_db(&state)?;
     conn.execute(
     "INSERT OR REPLACE INTO article_questions (article_id, questions_json, generated_at) VALUES (?1, ?2, ?3)",
@@ -2131,22 +2147,25 @@ async fn get_questions(
 }
 
 fn fallback_questions(article: &Article) -> Vec<Question> {
-    let evidence = article.paragraphs.first().cloned().unwrap_or_default();
-    vec![Question {
-        id: "main-idea".into(),
-        prompt: "本文の最初の段落で直接述べられている内容はどれですか。".into(),
-        choices: vec![
-            evidence.clone(),
-            "本文には書かれていない別の出来事を説明している。".into(),
-            "本文と関係のない人物について紹介している。".into(),
-            "本文にはない結論を先に述べている。".into(),
-        ],
-        answer_index: 0,
-        evidence,
-        explanation:
-            "解析：正确选项直接摘自原文首段；配置 API Key 后将生成三道有区分度的证据绑定题。".into(),
-        tested_expressions: vec![],
-    }]
+    let len = article.paragraphs.len();
+    let indices = [0, len.saturating_sub(1) / 2, len.saturating_sub(1)];
+    indices.into_iter().enumerate().map(|(number, index)| {
+        let evidence = article.paragraphs.get(index).cloned().unwrap_or_default();
+        Question {
+            id: format!("local-evidence-{}", number + 1),
+            prompt: format!("本文の内容として、原文で直接確認できるものはどれですか。（{}）", number + 1),
+            choices: vec![
+                evidence.clone(),
+                "本文では、この記事の出来事がすべて中止されたと説明している。".into(),
+                "本文では、関係者が情報を全面的に否定したと述べている。".into(),
+                "本文では、この話題と無関係な出来事だけを紹介している。".into(),
+            ],
+            answer_index: 0,
+            evidence,
+            explanation: "解析：正确选项直接引用自本文；其他选项没有原文依据。AI 出题服务恢复后可重新生成更有区分度的题目。".into(),
+            tested_expressions: vec![],
+        }
+    }).collect()
 }
 
 fn current_week() -> String {
@@ -2697,6 +2716,30 @@ mod tests {
     }
 
     #[test]
+    fn missing_question_id_is_generated_locally() {
+        let mut set: QuestionSet = serde_json::from_value(serde_json::json!({
+            "questions": [{
+                "prompt": "本文の内容はどれですか。", "choices": ["A", "B", "C", "D"],
+                "answerIndex": 0, "evidence": "原文", "explanation": "解析：原文にある。", "testedExpressions": []
+            }]
+        })).unwrap();
+        ensure_question_ids(&mut set.questions);
+        assert!(set.questions[0].id.starts_with("ai-question-1-"));
+    }
+
+    #[test]
+    fn local_question_fallback_always_provides_three_evidence_questions() {
+        let article = Article {
+            id: "fallback-article".into(), title: "测试".into(), source: "test".into(), url: "https://example.com".into(),
+            published_at: "2026-07-13".into(), paragraphs: vec!["第一段原文。".into(), "第二段原文。".into(), "第三段原文。".into()],
+            images: vec![], embeds: vec![], reading_minutes: 1, difficulty: "N3".into(), is_exploration: false,
+        };
+        let questions = fallback_questions(&article);
+        assert_eq!(questions.len(), 3);
+        assert!(questions.iter().all(|question| article.paragraphs.contains(&question.evidence)));
+    }
+
+    #[test]
     #[ignore = "requires the locally configured AI gateway"]
     fn live_configured_gateway_returns_usable_explanation() {
         tauri::async_runtime::block_on(async {
@@ -2718,6 +2761,20 @@ mod tests {
             assert_ne!(fallback.reading, "見放題最速配信スタートする");
             assert!(!fallback.translation.contains("[READING]"));
             assert!(!fallback.context_note.contains("Schema"));
+        });
+    }
+
+    #[test]
+    #[ignore = "requires the locally configured AI gateway and article database"]
+    fn live_configured_gateway_generates_questions_with_ids() {
+        tauri::async_runtime::block_on(async {
+            let home = std::env::var_os("HOME").unwrap();
+            let db = PathBuf::from(home).join("Library/Application Support/com.xtnntn.nihongo-daily-reader/learning.sqlite3");
+            let conn = Connection::open(db).unwrap();
+            let article = conn.query_row("SELECT * FROM articles ORDER BY rowid DESC LIMIT 1", [], article_from_row).unwrap();
+            let questions = generate_questions(article, vec![], None).await.unwrap();
+            assert_eq!(questions.len(), 3);
+            assert!(questions.iter().all(|question| !question.id.trim().is_empty()));
         });
     }
 
